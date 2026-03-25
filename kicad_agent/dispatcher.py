@@ -302,13 +302,39 @@ def connect_pins(
     return {"status": "ok"}
 
 
-def add_net_label(net_name: str, x: float, y: float, sheet: str) -> dict:
+def add_net_label(
+    net_name: str,
+    sheet: str,
+    snap_to_ref: str | None = None,
+    snap_to_pin: str | None = None,
+    x: float | None = None,
+    y: float | None = None,
+    rotation: float = 0,
+) -> dict:
     if sheet not in _project_state["sheets"]:
         return {"status": "error", "message": f"Sheet '{sheet}' not found."}
+
+    # Snap-to-pin: resolve coordinates from the symbol's pin endpoint.
+    # In a real implementation this calls get_pin_positions() and looks up the pin.
+    # The stub records the intent so Claude can see the snap was requested.
+    if snap_to_ref and snap_to_pin:
+        label = {"net_name": net_name, "snap_to_ref": snap_to_ref,
+                 "snap_to_pin": snap_to_pin, "rotation": rotation,
+                 "note": "STUB — real impl resolves pin endpoint coords automatically"}
+        _project_state["sheets"][sheet]["labels"].append(label)
+        return {
+            "status": "ok", "net_name": net_name,
+            "snapped_to": f"{snap_to_ref}:{snap_to_pin}",
+            "note": "STUB — pin endpoint will be resolved in real implementation",
+        }
+
+    if x is None or y is None:
+        return {"status": "error", "message": "Provide either snap_to_ref+snap_to_pin or explicit x,y."}
+
     _project_state["sheets"][sheet]["labels"].append(
-        {"net_name": net_name, "x": x, "y": y}
+        {"net_name": net_name, "x": x, "y": y, "rotation": rotation}
     )
-    return {"status": "ok", "net_name": net_name}
+    return {"status": "ok", "net_name": net_name, "x": x, "y": y}
 
 
 def add_no_connect(reference: str, pin: str, sheet: str) -> dict:
@@ -318,6 +344,114 @@ def add_no_connect(reference: str, pin: str, sheet: str) -> dict:
         {"reference": reference, "pin": pin}
     )
     return {"status": "ok"}
+
+
+def remove_no_connect(reference: str, pin: str, sheet: str) -> dict:
+    if sheet not in _project_state["sheets"]:
+        return {"status": "error", "message": f"Sheet '{sheet}' not found."}
+    nc_list = _project_state["sheets"][sheet]["no_connects"]
+    before = len(nc_list)
+    _project_state["sheets"][sheet]["no_connects"] = [
+        nc for nc in nc_list
+        if not (nc["reference"] == reference and nc["pin"] == pin)
+    ]
+    removed = before - len(_project_state["sheets"][sheet]["no_connects"])
+    if removed == 0:
+        return {"status": "error", "message": f"No no-connect marker found for {reference}:{pin}."}
+    return {"status": "ok", "removed": removed, "reference": reference, "pin": pin}
+
+
+def get_pin_positions(reference: str, sheet: str) -> dict:
+    """
+    Return all pin endpoints in schematic coordinates.
+
+    Real implementation must:
+      1. Locate the symbol's (lib_id) definition inside (lib_symbols ...) in the .kicad_sch
+      2. For each pin: read its (at x y angle) in symbol space
+      3. Apply placement transform: rotate by symbol rotation, flip if mirror_x=True
+      4. Apply Y-inversion: sch_y = place_y - sym_pin_y  (KiCad flips Y between spaces)
+      5. Add placement offset: sch_x = place_x + rotated_pin_x
+
+    All returned coordinates are in schematic space — callers never see symbol space.
+    """
+    sheet_data = _project_state["sheets"].get(sheet)
+    if not sheet_data:
+        return {"status": "error", "message": f"Sheet '{sheet}' not found."}
+    symbol = next(
+        (s for s in sheet_data["symbols"] if s["reference"] == reference), None
+    )
+    if not symbol:
+        return {"status": "error", "message": f"Symbol '{reference}' not found on sheet '{sheet}'."}
+    return {
+        "status": "ok",
+        "note": "STUB — replace with real pin endpoint calculation (see docstring for transform steps)",
+        "reference": reference,
+        "placement": {"x": symbol["x"], "y": symbol["y"], "rotation": symbol.get("rotation", 0)},
+        "coordinate_space": "schematic (Y-inversion applied)",
+        "pins": [],  # Real: [{pin_name, pin_number, sch_x, sch_y, direction}]
+    }
+
+
+def move_symbol(
+    reference: str,
+    x: float,
+    y: float,
+    sheet: str,
+    rotation: float | None = None,
+) -> dict:
+    sheet_data = _project_state["sheets"].get(sheet)
+    if not sheet_data:
+        return {"status": "error", "message": f"Sheet '{sheet}' not found."}
+    symbol = next(
+        (s for s in sheet_data["symbols"] if s["reference"] == reference), None
+    )
+    if not symbol:
+        return {"status": "error", "message": f"Symbol '{reference}' not found on sheet '{sheet}'."}
+    old = {"x": symbol["x"], "y": symbol["y"], "rotation": symbol.get("rotation", 0)}
+    symbol["x"] = x
+    symbol["y"] = y
+    if rotation is not None:
+        symbol["rotation"] = rotation
+    return {"status": "ok", "reference": reference, "from": old, "to": {"x": x, "y": y}}
+
+
+def move_label(
+    net_name: str,
+    sheet: str,
+    snap_to_ref: str | None = None,
+    snap_to_pin: str | None = None,
+    x: float | None = None,
+    y: float | None = None,
+    rotation: float | None = None,
+) -> dict:
+    sheet_data = _project_state["sheets"].get(sheet)
+    if not sheet_data:
+        return {"status": "error", "message": f"Sheet '{sheet}' not found."}
+    label = next(
+        (lb for lb in sheet_data["labels"] if lb["net_name"] == net_name), None
+    )
+    if not label:
+        return {"status": "error", "message": f"Label '{net_name}' not found on sheet '{sheet}'."}
+
+    if snap_to_ref and snap_to_pin:
+        label["snap_to_ref"] = snap_to_ref
+        label["snap_to_pin"] = snap_to_pin
+        if rotation is not None:
+            label["rotation"] = rotation
+        return {
+            "status": "ok", "net_name": net_name,
+            "snapped_to": f"{snap_to_ref}:{snap_to_pin}",
+            "note": "STUB — pin endpoint will be resolved in real implementation",
+        }
+
+    if x is None or y is None:
+        return {"status": "error", "message": "Provide either snap_to_ref+snap_to_pin or explicit x,y."}
+
+    label["x"] = x
+    label["y"] = y
+    if rotation is not None:
+        label["rotation"] = rotation
+    return {"status": "ok", "net_name": net_name, "x": x, "y": y}
 
 
 def assign_footprint(reference: str, footprint_path: str) -> dict:
@@ -331,27 +465,61 @@ def run_erc(scope: str = "all") -> dict:
     """
     Stub ERC. Replace with a call to KiCad's ERC engine via the IPC API
     or the pcbnew Python scripting interface.
+
+    Real implementation should return one entry per violation with:
+      type           — pin_unconnected | label_dangling | duplicate_ref |
+                       missing_power_flag | bus_entry_conflict | ...
+      severity       — error | warning
+      symbol_ref     — e.g. "U2"
+      pin_name       — e.g. "LRCLK" (if applicable)
+      position_x/y   — schematic coordinates of the violation
+      suggested_fix  — human/AI-readable fix description, e.g.:
+                       "Move label I2S_LRCLK 2.54mm left to snap to U2:LRCLK pin endpoint"
     """
     sheets_to_check = (
         list(_project_state["sheets"].keys())
         if scope == "all"
         else ["current_sheet"]
     )
-    # Naive checks: look for symbols without assigned footprints
+    errors = []
     warnings = []
+
     for ref in _project_state["bom"]:
         if ref not in _project_state["footprints"]:
             warnings.append({
                 "type": "missing_footprint",
-                "reference": ref,
-                "message": f"{ref}: footprint not yet assigned",
+                "severity": "warning",
+                "symbol_ref": ref,
+                "pin_name": None,
+                "position_x": None,
+                "position_y": None,
+                "suggested_fix": f"Call assign_footprint(reference='{ref}', footprint_path='...')",
             })
+
+    # Check for labels that record a snap intent but weren't resolved (stub indicator)
+    for sheet_name, sheet_data in _project_state["sheets"].items():
+        for label in sheet_data.get("labels", []):
+            if "snap_to_ref" in label and "x" not in label:
+                errors.append({
+                    "type": "label_dangling",
+                    "severity": "error",
+                    "symbol_ref": label.get("snap_to_ref"),
+                    "pin_name": label.get("snap_to_pin"),
+                    "position_x": None,
+                    "position_y": None,
+                    "suggested_fix": (
+                        f"Resolve pin endpoint for {label['snap_to_ref']}:{label['snap_to_pin']} "
+                        f"and place label '{label['net_name']}' at that coordinate."
+                    ),
+                })
+
     return {
         "status": "ok",
         "scope": scope,
         "sheets_checked": sheets_to_check,
-        "error_count": 0,
+        "error_count": len(errors),
         "warning_count": len(warnings),
+        "errors": errors,
         "warnings": warnings,
         "note": "STUB ERC — replace with real KiCad ERC engine",
     }
@@ -781,6 +949,10 @@ _DISPATCH_TABLE: dict[str, Any] = {
     "connect_pins":            connect_pins,
     "add_net_label":           add_net_label,
     "add_no_connect":          add_no_connect,
+    "remove_no_connect":       remove_no_connect,
+    "get_pin_positions":       get_pin_positions,
+    "move_symbol":             move_symbol,
+    "move_label":              move_label,
     "assign_footprint":        assign_footprint,
     "run_erc":                 run_erc,
     # Phase 4

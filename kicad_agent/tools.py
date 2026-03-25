@@ -246,18 +246,22 @@ TOOLS = [
     {
         "name": "add_net_label",
         "description": (
-            "Add a named net label. Use instead of long wires or to connect signals "
-            "across sheets. Required for all inter-sheet connections."
+            "Add a named net label. Preferred: pass snap_to_ref + snap_to_pin to place "
+            "the label exactly at a pin endpoint (no coordinate math needed). "
+            "Falls back to explicit x/y when snap targets are not provided."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "net_name": {"type": "string"},
-                "x":        {"type": "number"},
-                "y":        {"type": "number"},
-                "sheet":    {"type": "string"}
+                "net_name":    {"type": "string"},
+                "sheet":       {"type": "string"},
+                "snap_to_ref": {"type": "string", "description": "Symbol reference to snap to, e.g. 'U2'"},
+                "snap_to_pin": {"type": "string", "description": "Pin name or number to snap to, e.g. 'LRCLK'"},
+                "x":           {"type": "number", "description": "Explicit X (schematic coords). Used only when snap not provided."},
+                "y":           {"type": "number", "description": "Explicit Y (schematic coords). Used only when snap not provided."},
+                "rotation":    {"type": "number", "default": 0}
             },
-            "required": ["net_name", "x", "y", "sheet"]
+            "required": ["net_name", "sheet"]
         }
     },
 
@@ -272,6 +276,78 @@ TOOLS = [
                 "sheet":     {"type": "string"}
             },
             "required": ["reference", "pin", "sheet"]
+        }
+    },
+
+    {
+        "name": "remove_no_connect",
+        "description": (
+            "Remove a no-connect marker from a pin. "
+            "Use before connecting a pin that was previously marked no-connect."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reference": {"type": "string"},
+                "pin":       {"type": "string"},
+                "sheet":     {"type": "string"}
+            },
+            "required": ["reference", "pin", "sheet"]
+        }
+    },
+
+    {
+        "name": "get_pin_positions",
+        "description": (
+            "Return all pin endpoints for a symbol in schematic coordinates. "
+            "All positions account for symbol placement, rotation, mirroring, and "
+            "the KiCad Y-axis inversion — callers always receive schematic-space coords. "
+            "Use this before placing net labels or wires to avoid off-by-grid errors."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reference": {"type": "string", "description": "Symbol reference, e.g. 'U2'"},
+                "sheet":     {"type": "string"}
+            },
+            "required": ["reference", "sheet"]
+        }
+    },
+
+    {
+        "name": "move_symbol",
+        "description": "Move a placed symbol to a new position on the schematic sheet.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reference": {"type": "string"},
+                "x":         {"type": "number"},
+                "y":         {"type": "number"},
+                "sheet":     {"type": "string"},
+                "rotation":  {"type": "number", "description": "New rotation in degrees. Omit to keep current."}
+            },
+            "required": ["reference", "x", "y", "sheet"]
+        }
+    },
+
+    {
+        "name": "move_label",
+        "description": (
+            "Move an existing net label to a new position or snap it to a pin endpoint. "
+            "Preferred: pass snap_to_ref + snap_to_pin to eliminate label_dangling ERC errors."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "net_name":    {"type": "string"},
+                "sheet":       {"type": "string"},
+                "snap_to_ref": {"type": "string", "description": "Snap to this symbol's pin endpoint"},
+                "snap_to_pin": {"type": "string"},
+                "x":           {"type": "number", "description": "Explicit X. Used only when snap not provided."},
+                "y":           {"type": "number"},
+                "rotation":    {"type": "number"}
+            },
+            "required": ["net_name", "sheet"]
         }
     },
 
@@ -294,8 +370,10 @@ TOOLS = [
     {
         "name": "run_erc",
         "description": (
-            "Run Electrical Rules Check. "
-            "Returns all violations with type, location, and affected pins."
+            "Run Electrical Rules Check. Returns structured violations: "
+            "{type, severity, symbol_ref, pin_name, position_x, position_y, suggested_fix}. "
+            "Types include: pin_unconnected, label_dangling, duplicate_ref, missing_power_flag, "
+            "bus_entry_conflict. Use suggested_fix to resolve each error programmatically."
         ),
         "input_schema": {
             "type": "object",
