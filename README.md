@@ -1,6 +1,6 @@
 # KiCad AI Project Creator
 
-An MCP server that gives Claude Code 30 KiCad design tools across the full PCB
+An MCP server that gives Claude Code 41 KiCad design tools across the full PCB
 workflow. Once installed, the tools are available in every Claude Code session
 on your machine — open Claude from any directory and just describe what you want
 to build.
@@ -17,7 +17,7 @@ cd kicad-ai-project-creator
 ./setup.sh
 ```
 
-This installs the `mcp` Python package and registers the server globally with
+This installs project dependencies (`mcp`, `kicad-python`, etc.) and registers the server globally with
 Claude Code (`--scope user`), so it's available from any directory.
 
 ---
@@ -36,7 +36,7 @@ Verify the server is connected:
 /mcp
 ```
 
-You should see `kicad` listed as an active server. All 30 tools are then
+You should see `kicad` listed as an active server. All 41 tools are then
 available in every message — just describe what you want to design.
 
 ---
@@ -67,8 +67,9 @@ read the datasheets in mcu/datasheets/ first.
 
 | Phase | Tools |
 |-------|-------|
+| Runtime / Project | `set_project`, `get_capabilities`, `set_drc_severity`, `add_drc_exclusion` |
 | Research | `search_components`, `get_datasheet`, `verify_kicad_footprint`, `generate_custom_footprint`, `impedance_calc` |
-| Schematic | `create_schematic_sheet`, `add_symbol`, `add_power_symbol`, `connect_pins`, `add_net_label`, `add_no_connect`, `assign_footprint`, `run_erc` |
+| Schematic | `create_schematic_sheet`, `add_symbol`, `add_power_symbol`, `connect_pins`, `add_net_label`, `add_no_connect`, `remove_no_connect`, `get_pin_positions`, `move_symbol`, `move_label`, `assign_footprint`, `run_erc` |
 | PCB Layout | `set_board_outline`, `add_mounting_holes`, `place_footprint`, `get_ratsnest`, `add_keepout_zone` |
 | Copper Pours | `add_zone`, `fill_zones` |
 | Routing | `route_trace`, `route_differential_pair`, `add_via` |
@@ -94,14 +95,14 @@ kicad-ai-project-creator/
 
 ## Connecting to real KiCad
 
-`dispatcher.py` ships with stub implementations that keep state in memory and
-return `"note": "STUB"` so Claude can reason through the design without a live
-KiCad instance.
+`dispatcher.py` uses mixed backends and can fall back to in-memory stubs:
 
-To connect to a real KiCad instance, replace each stub with a call to:
+- `kicad-cli`: ERC/DRC and fabrication exports
+- `kipy` IPC (`kicad-python`): selected live PCB operations
+- Direct `.kicad_sch` editing: selected schematic operations
+- Stub fallback: used when a real backend is unavailable for a specific tool
 
-- **KiCad IPC API** (KiCad 8+): `https://dev-docs.kicad.org/en/ipc/`
-- **pcbnew Python API**: `import pcbnew` (available in KiCad's scripting console)
+Call `get_capabilities` first in a session to see what is available on the current machine and whether `pcb_file`/`sch_file` are set.
 
 Each function must return a JSON-serialisable `dict` with `{"status": "ok"}` on
 success or `{"status": "error", "message": "..."}` on failure.

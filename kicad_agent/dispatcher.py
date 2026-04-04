@@ -17,10 +17,13 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
+import shutil
 import subprocess
 import tempfile
+import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, List, Union
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -39,6 +42,312 @@ _project_state: dict[str, Any] = {
     "board_outline": None, # {width, height, corner_radius}
     "bom": {},             # reference → component info
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# S-expression parser and schematic helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+SExpr = Union[str, List]
+
+
+def _tokenize_sexpr(text: str) -> list[str]:
+    tokens: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c in ' \t\n\r':
+            i += 1
+        elif c == '(':
+            tokens.append('(')
+            i += 1
+        elif c == ')':
+            tokens.append(')')
+            i += 1
+        elif c == '"':
+            j = i + 1
+            while j < n:
+                if text[j] == '\\':
+                    j += 2
+                elif text[j] == '"':
+                    break
+                else:
+                    j += 1
+            tokens.append(text[i + 1:j])
+            i = j + 1
+        else:
+            j = i
+            while j < n and text[j] not in ' \t\n\r()"':
+                j += 1
+            tokens.append(text[i:j])
+            i = j
+    return tokens
+
+
+def _parse_sexpr(text: str) -> SExpr:
+    tokens = _tokenize_sexpr(text)
+    pos = [0]
+
+    def _parse_one() -> SExpr:
+        if pos[0] >= len(tokens):
+            raise ValueError("Unexpected end of S-expression")
+        tok = tokens[pos[0]]
+        if tok == '(':
+            pos[0] += 1
+            items: list = []
+            while pos[0] < len(tokens) and tokens[pos[0]] != ')':
+                items.append(_parse_one())
+            pos[0] += 1  # consume ')'
+            return items
+        else:
+            pos[0] += 1
+            return tok
+
+    return _parse_one()
+
+
+def _sx_find(node: SExpr, key: str) -> SExpr | None:
+    """Return first direct child list whose first element == key."""
+    if not isinstance(node, list):
+        return None
+    for child in node:
+        if isinstance(child, list) and child and child[0] == key:
+            return child
+    return None
+
+
+def _sx_findall(node: SExpr, key: str) -> list[SExpr]:
+    """Return all direct child lists whose first element == key."""
+    if not isinstance(node, list):
+        return []
+    return [c for c in node if isinstance(c, list) and c and c[0] == key]
+
+
+def _sx_get_property(sym_node: SExpr, prop_name: str) -> str | None:
+    """Return the value of a (property "NAME" "VALUE" ...) child."""
+    for child in _sx_findall(sym_node, "property"):
+        if len(child) >= 3 and child[1] == prop_name:
+            return child[2]
+    return None
+
+
+def _parse_sch_file(sch_file: str) -> SExpr:
+    """Parse a .kicad_sch file and return the top-level S-expression tree."""
+    text = Path(sch_file).read_text(encoding="utf-8")
+    return _parse_sexpr(text)
+
+
+def _sch_lib_symbols(sch_tree: SExpr) -> dict[str, SExpr]:
+    """Return {lib_id: symbol_node} for all symbols in (lib_symbols ...)."""
+    lib_block = _sx_find(sch_tree, "lib_symbols")
+    if not lib_block:
+        return {}
+    result: dict[str, SExpr] = {}
+    for child in lib_block:
+        if isinstance(child, list) and child and child[0] == "symbol":
+            lib_id = child[1] if len(child) > 1 and isinstance(child[1], str) else None
+            if lib_id:
+                result[lib_id] = child
+    return result
+
+
+def _sch_placed_symbols(sch_tree: SExpr) -> dict[str, dict]:
+    """
+    Return {reference: {lib_id, x, y, rotation, mirror_x, mirror_y}}
+    for every placed symbol instance at the top level of the schematic.
+    """
+    result: dict[str, dict] = {}
+    for child in sch_tree:
+        if not (isinstance(child, list) and child and child[0] == "symbol"):
+            continue
+        lib_id_node = _sx_find(child, "lib_id")
+        at_node = _sx_find(child, "at")
+        if not lib_id_node or not at_node:
+            continue
+        lib_id = lib_id_node[1] if len(lib_id_node) > 1 else ""
+        try:
+            px = float(at_node[1])
+            py = float(at_node[2])
+            rot = float(at_node[3]) if len(at_node) > 3 else 0.0
+        except (IndexError, ValueError):
+            continue
+
+        mirror_node = _sx_find(child, "mirror")
+        mirror_x = mirror_y = False
+        if mirror_node:
+            for m in mirror_node[1:]:
+                if m == "x":
+                    mirror_x = True
+                if m == "y":
+                    mirror_y = True
+
+        # Reference is in a (property "Reference" "REF" ...) child
+        ref = _sx_get_property(child, "Reference")
+        if ref and not ref.startswith("#"):
+            result[ref] = {
+                "lib_id": lib_id,
+                "x": px, "y": py, "rotation": rot,
+                "mirror_x": mirror_x, "mirror_y": mirror_y,
+            }
+    return result
+
+
+def _lib_sym_pins(lib_sym: SExpr) -> list[dict]:
+    """
+    Collect all (pin ...) entries from a lib symbol (including sub-symbol units).
+    Returns list of {name, number, x, y, angle}.
+    The (at x y angle) in a pin definition gives the *connection endpoint*
+    in symbol space (KiCad convention: Y is up in symbol space).
+    """
+    pins: list[dict] = []
+
+    def _collect(node: SExpr) -> None:
+        if not isinstance(node, list):
+            return
+        for child in node:
+            if not isinstance(child, list) or not child:
+                continue
+            if child[0] == "pin":
+                at_node = _sx_find(child, "at")
+                name_node = _sx_find(child, "name")
+                num_node = _sx_find(child, "number")
+                if at_node and len(at_node) >= 3:
+                    try:
+                        px = float(at_node[1])
+                        py = float(at_node[2])
+                        angle = float(at_node[3]) if len(at_node) > 3 else 0.0
+                    except ValueError:
+                        continue
+                    pin_name = name_node[1] if name_node and len(name_node) > 1 else ""
+                    pin_num = num_node[1] if num_node and len(num_node) > 1 else ""
+                    pins.append({"name": pin_name, "number": pin_num,
+                                 "x": px, "y": py, "angle": angle})
+            elif child[0] == "symbol":
+                _collect(child)
+
+    _collect(lib_sym)
+    return pins
+
+
+def _transform_pin(px: float, py: float,
+                   place_x: float, place_y: float,
+                   rotation: float,
+                   mirror_x: bool, mirror_y: bool) -> tuple[float, float]:
+    """
+    Transform a pin's symbol-space coordinates to schematic space.
+
+    KiCad convention:
+      - Symbol space: Y-up (mathematical)
+      - Schematic space: Y-down (screen)
+      - Transform: apply mirror → rotate (CCW in math space) → Y-invert + translate
+    """
+    if mirror_x:
+        px = -px
+    if mirror_y:
+        py = -py
+    rad = math.radians(rotation)
+    rot_x = px * math.cos(rad) - py * math.sin(rad)
+    rot_y = px * math.sin(rad) + py * math.cos(rad)
+    sch_x = round(place_x + rot_x, 4)
+    sch_y = round(place_y - rot_y, 4)
+    return sch_x, sch_y
+
+
+def _resolve_pin_endpoint(
+    sch_file: str, reference: str, pin_id: str
+) -> tuple[float, float] | None:
+    """
+    Return the schematic-space (x, y) of a pin endpoint.
+    pin_id is matched against pin name OR pin number (case-insensitive).
+    Returns None if not found.
+    """
+    tree = _parse_sch_file(sch_file)
+    placed = _sch_placed_symbols(tree)
+    lib_syms = _sch_lib_symbols(tree)
+
+    sym_info = placed.get(reference)
+    if not sym_info:
+        return None
+    lib_sym = lib_syms.get(sym_info["lib_id"])
+    if not lib_sym:
+        return None
+
+    pins = _lib_sym_pins(lib_sym)
+    pin_id_lower = pin_id.lower()
+    match = next(
+        (p for p in pins
+         if p["name"].lower() == pin_id_lower or p["number"] == pin_id),
+        None,
+    )
+    if not match:
+        return None
+
+    return _transform_pin(
+        match["x"], match["y"],
+        sym_info["x"], sym_info["y"],
+        sym_info["rotation"], sym_info["mirror_x"], sym_info["mirror_y"],
+    )
+
+
+def _gen_uuid() -> str:
+    return str(uuid.uuid4())
+
+
+def _wire_sexp(x1: float, y1: float, x2: float, y2: float) -> str:
+    return (
+        f'\t(wire\n'
+        f'\t\t(pts\n'
+        f'\t\t\t(xy {x1} {y1}) (xy {x2} {y2})\n'
+        f'\t\t)\n'
+        f'\t\t(stroke\n'
+        f'\t\t\t(width 0)\n'
+        f'\t\t\t(type default)\n'
+        f'\t\t)\n'
+        f'\t\t(uuid "{_gen_uuid()}")\n'
+        f'\t)\n'
+    )
+
+
+def _label_sexp(net_name: str, x: float, y: float, rotation: float = 0) -> str:
+    justify = "right bottom" if abs(rotation - 180) < 1 else "left bottom"
+    return (
+        f'\t(label "{net_name}"\n'
+        f'\t\t(at {x} {y} {int(rotation)})\n'
+        f'\t\t(effects\n'
+        f'\t\t\t(font\n'
+        f'\t\t\t\t(size 1.27 1.27)\n'
+        f'\t\t\t)\n'
+        f'\t\t\t(justify {justify})\n'
+        f'\t\t)\n'
+        f'\t\t(uuid "{_gen_uuid()}")\n'
+        f'\t)\n'
+    )
+
+
+def _no_connect_sexp(x: float, y: float) -> str:
+    return (
+        f'\t(no_connect\n'
+        f'\t\t(at {x} {y})\n'
+        f'\t\t(uuid "{_gen_uuid()}")\n'
+        f'\t)\n'
+    )
+
+
+def _append_to_sch(sch_file: str, sexp_text: str) -> None:
+    """
+    Insert sexp_text into the .kicad_sch file just before the final closing paren.
+    Creates a backup (.bak) before writing.
+    """
+    path = Path(sch_file)
+    content = path.read_text(encoding="utf-8")
+    # Find the last ')' and insert before it
+    idx = content.rfind(')')
+    if idx == -1:
+        raise ValueError(f"No closing ')' found in {sch_file}")
+    new_content = content[:idx] + sexp_text + content[idx:]
+    path.with_suffix(".kicad_sch.bak").write_text(content, encoding="utf-8")
+    path.write_text(new_content, encoding="utf-8")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -145,6 +454,54 @@ def set_project(
         "status": "ok",
         "pcb_file": _project_state["pcb_file"],
         "sch_file": _project_state["sch_file"],
+    }
+
+
+def get_capabilities() -> dict:
+    """Report runtime capabilities and current project context."""
+    kicad_cli_path = shutil.which("kicad-cli")
+
+    kipy_available = False
+    kipy_import_error = None
+    try:
+        from kipy.kicad import KiCad  # noqa: F401
+        kipy_available = True
+    except Exception as exc:  # noqa: BLE001
+        kipy_import_error = f"{type(exc).__name__}: {exc}"
+
+    pcb_file = _project_state.get("pcb_file")
+    sch_file = _project_state.get("sch_file")
+
+    return {
+        "status": "ok",
+        "server": "kicad",
+        "active_project": {
+            "pcb_file": pcb_file,
+            "sch_file": sch_file,
+            "pcb_file_exists": bool(pcb_file and Path(pcb_file).exists()),
+            "sch_file_exists": bool(sch_file and Path(sch_file).exists()),
+        },
+        "backends": {
+            "kicad_cli": {
+                "available": bool(kicad_cli_path),
+                "path": kicad_cli_path,
+                "used_for": ["run_erc", "run_drc", "generate_* exports"],
+            },
+            "kipy_ipc": {
+                "available": kipy_available,
+                "socket_env": os.environ.get("KICAD_API_SOCKET"),
+                "used_for": ["place_footprint", "get_ratsnest", "fill_zones"],
+                "import_error": kipy_import_error,
+            },
+            "schematic_file_editing": {
+                "available": bool(sch_file and Path(sch_file).exists()),
+                "used_for": ["connect_pins", "add_net_label", "add_no_connect", "get_pin_positions"],
+            },
+            "stub_fallback": {
+                "available": True,
+                "note": "Used when real backend is unavailable for a tool.",
+            },
+        },
     }
 
 
@@ -433,13 +790,56 @@ def connect_pins(
     to_ref: str, to_pin: str,
     sheet: str,
 ) -> dict:
+    sch = _sch_file()
+    if sch:
+        try:
+            p1 = _resolve_pin_endpoint(sch, from_ref, from_pin)
+            if p1 is None:
+                return {
+                    "status": "error",
+                    "message": f"Pin '{from_pin}' not found on '{from_ref}'. "
+                               "Use get_pin_positions to verify pin names/numbers.",
+                }
+            p2 = _resolve_pin_endpoint(sch, to_ref, to_pin)
+            if p2 is None:
+                return {
+                    "status": "error",
+                    "message": f"Pin '{to_pin}' not found on '{to_ref}'. "
+                               "Use get_pin_positions to verify pin names/numbers.",
+                }
+            x1, y1 = p1
+            x2, y2 = p2
+            # Route L-shaped: horizontal first, then vertical (or straight if aligned)
+            sexp = ""
+            if abs(x1 - x2) < 0.001:
+                # Already vertical
+                sexp = _wire_sexp(x1, y1, x2, y2)
+            elif abs(y1 - y2) < 0.001:
+                # Already horizontal
+                sexp = _wire_sexp(x1, y1, x2, y2)
+            else:
+                # L-route: go horizontal to x2, then vertical to y2
+                sexp = _wire_sexp(x1, y1, x2, y1) + _wire_sexp(x2, y1, x2, y2)
+            _append_to_sch(sch, sexp)
+            return {
+                "status": "ok",
+                "source": "kicad_sch",
+                "from": {"ref": from_ref, "pin": from_pin, "x": x1, "y": y1},
+                "to":   {"ref": to_ref,   "pin": to_pin,   "x": x2, "y": y2},
+                "segments_written": 1 if abs(x1 - x2) < 0.001 or abs(y1 - y2) < 0.001 else 2,
+            }
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to write wire: {e}"}
+
+    # In-memory fallback (no sch_file set)
     if sheet not in _project_state["sheets"]:
         return {"status": "error", "message": f"Sheet '{sheet}' not found."}
     _project_state["sheets"][sheet]["wires"].append({
         "from_ref": from_ref, "from_pin": from_pin,
         "to_ref": to_ref, "to_pin": to_pin,
     })
-    return {"status": "ok"}
+    return {"status": "ok", "source": "stub",
+            "note": "Set sch_file via set_project() to write wires to disk."}
 
 
 def add_net_label(
@@ -451,39 +851,78 @@ def add_net_label(
     y: float | None = None,
     rotation: float = 0,
 ) -> dict:
-    if sheet not in _project_state["sheets"]:
-        return {"status": "error", "message": f"Sheet '{sheet}' not found."}
+    sch = _sch_file()
 
-    # Snap-to-pin: resolve coordinates from the symbol's pin endpoint.
-    # In a real implementation this calls get_pin_positions() and looks up the pin.
-    # The stub records the intent so Claude can see the snap was requested.
+    # Resolve coordinates: snap-to-pin takes priority over explicit x/y
+    lx, ly = x, y
     if snap_to_ref and snap_to_pin:
-        label = {"net_name": net_name, "snap_to_ref": snap_to_ref,
-                 "snap_to_pin": snap_to_pin, "rotation": rotation,
-                 "note": "STUB — real impl resolves pin endpoint coords automatically"}
-        _project_state["sheets"][sheet]["labels"].append(label)
-        return {
-            "status": "ok", "net_name": net_name,
-            "snapped_to": f"{snap_to_ref}:{snap_to_pin}",
-            "note": "STUB — pin endpoint will be resolved in real implementation",
-        }
+        if sch:
+            pos = _resolve_pin_endpoint(sch, snap_to_ref, snap_to_pin)
+            if pos is None:
+                return {
+                    "status": "error",
+                    "message": f"Pin '{snap_to_pin}' not found on '{snap_to_ref}'. "
+                               "Use get_pin_positions to check available pins.",
+                }
+            lx, ly = pos
+        else:
+            # No file — record intent only
+            if sheet not in _project_state["sheets"]:
+                return {"status": "error", "message": f"Sheet '{sheet}' not found."}
+            _project_state["sheets"][sheet]["labels"].append(
+                {"net_name": net_name, "snap_to_ref": snap_to_ref,
+                 "snap_to_pin": snap_to_pin, "rotation": rotation}
+            )
+            return {
+                "status": "ok", "source": "stub",
+                "note": "Set sch_file via set_project() to snap to real pin coordinates.",
+                "snapped_to": f"{snap_to_ref}:{snap_to_pin}",
+            }
 
-    if x is None or y is None:
+    if lx is None or ly is None:
         return {"status": "error", "message": "Provide either snap_to_ref+snap_to_pin or explicit x,y."}
 
+    if sch:
+        try:
+            _append_to_sch(sch, _label_sexp(net_name, lx, ly, rotation))
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to write label: {e}"}
+        return {"status": "ok", "source": "kicad_sch",
+                "net_name": net_name, "x": lx, "y": ly, "rotation": rotation}
+
+    if sheet not in _project_state["sheets"]:
+        return {"status": "error", "message": f"Sheet '{sheet}' not found."}
     _project_state["sheets"][sheet]["labels"].append(
-        {"net_name": net_name, "x": x, "y": y, "rotation": rotation}
+        {"net_name": net_name, "x": lx, "y": ly, "rotation": rotation}
     )
-    return {"status": "ok", "net_name": net_name, "x": x, "y": y}
+    return {"status": "ok", "source": "stub",
+            "net_name": net_name, "x": lx, "y": ly}
 
 
 def add_no_connect(reference: str, pin: str, sheet: str) -> dict:
+    sch = _sch_file()
+    if sch:
+        pos = _resolve_pin_endpoint(sch, reference, pin)
+        if pos is None:
+            return {
+                "status": "error",
+                "message": f"Pin '{pin}' not found on '{reference}'. "
+                           "Use get_pin_positions to check available pins.",
+            }
+        try:
+            _append_to_sch(sch, _no_connect_sexp(pos[0], pos[1]))
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to write no-connect: {e}"}
+        return {"status": "ok", "source": "kicad_sch",
+                "reference": reference, "pin": pin, "x": pos[0], "y": pos[1]}
+
     if sheet not in _project_state["sheets"]:
         return {"status": "error", "message": f"Sheet '{sheet}' not found."}
     _project_state["sheets"][sheet]["no_connects"].append(
         {"reference": reference, "pin": pin}
     )
-    return {"status": "ok"}
+    return {"status": "ok", "source": "stub",
+            "note": "Set sch_file via set_project() to write no-connect to disk."}
 
 
 def remove_no_connect(reference: str, pin: str, sheet: str) -> dict:
@@ -504,16 +943,62 @@ def remove_no_connect(reference: str, pin: str, sheet: str) -> dict:
 def get_pin_positions(reference: str, sheet: str) -> dict:
     """
     Return all pin endpoints in schematic coordinates.
-
-    Real implementation must:
-      1. Locate the symbol's (lib_id) definition inside (lib_symbols ...) in the .kicad_sch
-      2. For each pin: read its (at x y angle) in symbol space
-      3. Apply placement transform: rotate by symbol rotation, flip if mirror_x=True
-      4. Apply Y-inversion: sch_y = place_y - sym_pin_y  (KiCad flips Y between spaces)
-      5. Add placement offset: sch_x = place_x + rotated_pin_x
-
-    All returned coordinates are in schematic space — callers never see symbol space.
+    When sch_file is set, reads the real .kicad_sch and applies the full
+    placement transform (mirror → rotate → Y-invert → translate).
+    Falls back to in-memory stub when no project file is configured.
     """
+    sch = _sch_file()
+    if sch:
+        try:
+            tree = _parse_sch_file(sch)
+            placed = _sch_placed_symbols(tree)
+            lib_syms = _sch_lib_symbols(tree)
+
+            sym_info = placed.get(reference)
+            if not sym_info:
+                return {"status": "error", "message": f"Symbol '{reference}' not found in {sch}."}
+            lib_sym = lib_syms.get(sym_info["lib_id"])
+            if not lib_sym:
+                return {
+                    "status": "error",
+                    "message": (
+                        f"Lib symbol '{sym_info['lib_id']}' not found in lib_symbols. "
+                        "It may be defined in an external .kicad_sym file."
+                    ),
+                }
+
+            raw_pins = _lib_sym_pins(lib_sym)
+            pins_out = []
+            for p in raw_pins:
+                sx, sy = _transform_pin(
+                    p["x"], p["y"],
+                    sym_info["x"], sym_info["y"],
+                    sym_info["rotation"],
+                    sym_info["mirror_x"], sym_info["mirror_y"],
+                )
+                pins_out.append({
+                    "pin_name": p["name"],
+                    "pin_number": p["number"],
+                    "sch_x": sx,
+                    "sch_y": sy,
+                })
+            return {
+                "status": "ok",
+                "source": "kicad_sch",
+                "reference": reference,
+                "placement": {
+                    "x": sym_info["x"], "y": sym_info["y"],
+                    "rotation": sym_info["rotation"],
+                    "mirror_x": sym_info["mirror_x"],
+                    "mirror_y": sym_info["mirror_y"],
+                },
+                "coordinate_space": "schematic (Y-inversion applied)",
+                "pins": pins_out,
+            }
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to read schematic: {e}"}
+
+    # In-memory fallback
     sheet_data = _project_state["sheets"].get(sheet)
     if not sheet_data:
         return {"status": "error", "message": f"Sheet '{sheet}' not found."}
@@ -524,11 +1009,12 @@ def get_pin_positions(reference: str, sheet: str) -> dict:
         return {"status": "error", "message": f"Symbol '{reference}' not found on sheet '{sheet}'."}
     return {
         "status": "ok",
-        "note": "STUB — replace with real pin endpoint calculation (see docstring for transform steps)",
+        "source": "stub",
+        "note": "Set sch_file via set_project() for real pin positions.",
         "reference": reference,
         "placement": {"x": symbol["x"], "y": symbol["y"], "rotation": symbol.get("rotation", 0)},
         "coordinate_space": "schematic (Y-inversion applied)",
-        "pins": [],  # Real: [{pin_name, pin_number, sch_x, sch_y, direction}]
+        "pins": [],
     }
 
 
@@ -652,6 +1138,7 @@ def run_erc(scope: str = "all") -> dict:
         "sch_file": sch,
         "error_count": len(errors),
         "warning_count": len(warnings),
+        "all_clear": len(errors) == 0,
         "errors": errors,
         "warnings": warnings,
     }
@@ -1354,6 +1841,7 @@ def read_file(path: str, max_bytes: int = 65536) -> dict:
 _DISPATCH_TABLE: dict[str, Any] = {
     # Project setup & DRC rules
     "set_project":             set_project,
+    "get_capabilities":        get_capabilities,
     "set_drc_severity":        set_drc_severity,
     "add_drc_exclusion":       add_drc_exclusion,
     # Filesystem

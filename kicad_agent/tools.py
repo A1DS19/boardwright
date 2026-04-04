@@ -32,6 +32,18 @@ TOOLS = [
             }
         }
     },
+    {
+        "name": "get_capabilities",
+        "description": (
+            "Report runtime capabilities and active project context. "
+            "Use this first to see which backends are available (kicad-cli, kipy IPC), "
+            "and whether pcb_file/sch_file are set."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
 
     {
         "name": "set_drc_severity",
