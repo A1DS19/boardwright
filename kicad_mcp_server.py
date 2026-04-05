@@ -19,8 +19,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 import mcp.types as types
 
-from kicad_agent.tools import TOOLS
-from kicad_agent.dispatcher import dispatch_tool
+from kicad_agent import TOOLS, dispatch_tool
 
 server = Server("kicad")
 
