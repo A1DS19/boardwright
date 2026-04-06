@@ -77,12 +77,16 @@ def _sch_placed_symbols(sch_tree: SExpr) -> dict[str, dict]:
     return result
 
 
-def _lib_sym_pins(lib_sym: SExpr) -> list[dict]:
+def _lib_sym_pins(lib_sym: SExpr, lib_syms: "dict[str, SExpr] | None" = None) -> list[dict]:
     """
     Collect all (pin ...) entries from a lib symbol (including sub-symbol units).
     Returns list of {name, number, x, y, angle}.
     The (at x y angle) in a pin definition gives the *connection endpoint*
     in symbol space (KiCad convention: Y is up in symbol space).
+
+    If lib_syms is provided, resolves KiCad's (extends "ParentName") inheritance
+    so that variant symbols (e.g. ATmega48PB-A extending ATmega48PB) return pins
+    from their parent when they carry none of their own.
     """
     pins: list[dict] = []
 
@@ -111,6 +115,20 @@ def _lib_sym_pins(lib_sym: SExpr) -> list[dict]:
                 _collect(child)
 
     _collect(lib_sym)
+
+    # If no pins found, check for (extends "ParentName") and resolve from parent.
+    if not pins and lib_syms is not None:
+        extends_node = _sx_find(lib_sym, "extends")
+        if extends_node and len(extends_node) > 1:
+            parent_name = extends_node[1]
+            # lib_syms keys are "Library:SymbolName"; match by bare symbol name
+            parent_sym = next(
+                (v for k, v in lib_syms.items() if k.split(":")[-1] == parent_name),
+                None,
+            )
+            if parent_sym is not None:
+                pins = _lib_sym_pins(parent_sym, lib_syms)
+
     return pins
 
 
@@ -157,7 +175,7 @@ def _resolve_pin_endpoint(
     if not lib_sym:
         return None
 
-    pins = _lib_sym_pins(lib_sym)
+    pins = _lib_sym_pins(lib_sym, lib_syms)
     pin_id_lower = pin_id.lower()
     match = next(
         (p for p in pins
@@ -287,12 +305,13 @@ def _extract_raw_symbol(lib_text: str, symbol_name: str) -> str | None:
 
 def _prefix_symbol_names(raw_text: str, sym_name: str, lib_name: str) -> str:
     """
-    Prefix every (symbol "NAME") and (symbol "NAME_N_N") node inside the raw
-    symbol text with lib_name:. KiCad 9 requires this for both the top-level
-    symbol and all sub-unit entries when they appear in a schematic lib_symbols block.
+    Prefix only the top-level (symbol "NAME") entry with lib_name:.
+    KiCad 9 requires the top-level symbol in lib_symbols to be named
+    "lib:sym", but sub-unit entries like (symbol "NAME_0_1") must keep
+    their original names without any library prefix.
     """
     pattern = re.compile(
-        r'\(symbol "(' + re.escape(sym_name) + r'(?:_\d+_\d+)?)"'
+        r'\(symbol "(' + re.escape(sym_name) + r')"'
     )
     return pattern.sub(lambda m: f'(symbol "{lib_name}:{m.group(1)}"', raw_text)
 
@@ -329,6 +348,19 @@ def _ensure_lib_symbol_embedded(sch_file: str, library: str, symbol: str) -> str
     raw_sym = _extract_raw_symbol(lib_text, symbol)
     if raw_sym is None:
         return f"Symbol '{symbol}' not found in library '{library}' ({lib_file})."
+
+    # If this symbol extends a parent, embed the parent first so KiCad can
+    # resolve the inheritance chain (both must be present in lib_symbols).
+    extends_m = re.search(r'\(extends\s+"([^"]+)"', raw_sym)
+    if extends_m:
+        parent_name = extends_m.group(1)
+        err = _ensure_lib_symbol_embedded(sch_file, library, parent_name)
+        if err:
+            return err
+        # Re-read content after parent was written
+        content = path.read_text(encoding="utf-8")
+        if f'(symbol "{lib_id}"' in content:
+            return None  # child was somehow already present
 
     # Prefix ALL symbol names (top-level and sub-units) with "library:"
     prefixed = _prefix_symbol_names(raw_sym, symbol, library)

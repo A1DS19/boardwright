@@ -267,7 +267,7 @@ def get_pin_positions(reference: str, sheet: str) -> dict:
                     ),
                 }
 
-            raw_pins = _lib_sym_pins(lib_sym)
+            raw_pins = _lib_sym_pins(lib_sym, lib_syms)
             pins_out = []
             for p in raw_pins:
                 sx, sy = _transform_pin(

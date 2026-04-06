@@ -3,6 +3,90 @@
 from __future__ import annotations
 
 import math
+import os
+import re
+import tempfile
+from pathlib import Path
+from urllib.parse import unquote
+
+import pdfplumber
+import requests
+from dotenv import load_dotenv
+
+from ..state import _project_state
+
+load_dotenv()
+
+_MOUSER_SEARCH_URL = "https://api.mouser.com/api/v1/search/keyword"
+_DATASHEET_FOLDER = "mcp_kicad_datasheets"
+
+
+def _datasheets_dir() -> Path | None:
+    """
+    Return (and create) the datasheets folder inside the active project directory.
+    Returns None if no project has been set via set_project().
+    """
+    anchor = _project_state.get("pcb_file") or _project_state.get("sch_file")
+    if not anchor:
+        return None
+    folder = Path(anchor).parent / _DATASHEET_FOLDER
+    folder.mkdir(exist_ok=True)
+    return folder
+
+# Section header patterns for datasheet parsing
+_SECTION_HEADERS = [
+    "absolute maximum",
+    "maximum ratings",
+    "pin description",
+    "pin function",
+    "pinout",
+    "typical application",
+    "application circuit",
+    "recommended circuit",
+    "decoupling",
+    "bypass capacitor",
+    "electrical characteristics",
+    "dc characteristics",
+    "register summary",
+    "block diagram",
+    "package",
+]
+
+
+def _parse_stock(availability: str) -> int:
+    """Extract integer stock count from Mouser's availability string (e.g. '1,234 In Stock')."""
+    digits = re.sub(r"[^\d]", "", availability.split(" ")[0])
+    return int(digits) if digits else 0
+
+
+def _extract_package(image_path: str) -> str | None:
+    """
+    Extract package code from Mouser's ImagePath filename.
+    e.g. '.../TQFP_32_t.jpg' -> 'TQFP-32'
+    """
+    if not image_path:
+        return None
+    filename = image_path.rstrip("/").split("/")[-1]          # TQFP_32_t.jpg
+    stem = filename.rsplit(".", 1)[0]                          # TQFP_32_t
+    stem = re.sub(r"_t$", "", stem)                           # TQFP_32
+    return stem.replace("_", "-") if stem else None
+
+
+def _price_at_qty(price_breaks: list[dict], target_qty: int = 10) -> float | None:
+    """Return the unit price (USD) for the break that covers target_qty, or the last break."""
+    if not price_breaks:
+        return None
+    best = None
+    for pb in price_breaks:
+        try:
+            qty = int(pb.get("Quantity", 0))
+            price_str = pb.get("Price", "").replace(",", ".")
+            price = float(re.sub(r"[^\d.]", "", price_str))
+        except (ValueError, TypeError):
+            continue
+        if qty <= target_qty:
+            best = price
+    return best
 
 
 def search_components(
@@ -12,44 +96,294 @@ def search_components(
     in_stock_only: bool = True,
     preferred_distributors: list[str] | None = None,
 ) -> dict:
-    """
-    Stub: Search Octopart/Mouser for components.
+    """Search Mouser for real in-stock components matching a keyword query."""
+    api_key = os.getenv("MOUSER_API_KEY", "").strip()
+    if not api_key:
+        return {
+            "status": "error",
+            "message": "MOUSER_API_KEY not set — add it to your .env file.",
+        }
 
-    Replace with real Octopart GraphQL API call:
-      https://octopart.com/api/v4/reference
-    or Mouser Search API:
-      https://www.mouser.com/api-hub/
-    """
-    return {
-        "status": "ok",
-        "note": "STUB — wire up a real distributor API",
-        "results": [
-            {
-                "mpn": f"STUB-{query[:8].upper().replace(' ', '-')}",
-                "manufacturer": "StubCorp",
-                "description": query,
-                "package": package or "SOT-23",
-                "stock_mouser": 9999,
-                "price_usd_qty10": 0.42,
-                "kicad_footprint_hint": f"Package_TO_SOT_SMD:{package or 'SOT-23'}",
-                "datasheet_url": "https://example.com/stub_datasheet.pdf",
-            }
-        ],
+    # Append package to query if provided so Mouser filters by package type
+    keyword = f"{query} {package}".strip() if package else query
+    search_options = "InStock" if in_stock_only else "None"
+
+    payload = {
+        "SearchByKeywordRequest": {
+            "keyword": keyword,
+            "Records": max_results,
+            "StartingRecord": 0,
+            "SearchOptions": search_options,
+        }
     }
+
+    try:
+        resp = requests.post(
+            _MOUSER_SEARCH_URL,
+            params={"apiKey": api_key},
+            json=payload,
+            timeout=10,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        return {"status": "error", "message": f"Mouser API request failed: {exc}"}
+
+    data = resp.json()
+    errors = data.get("Errors") or []
+    if errors:
+        return {"status": "error", "message": "; ".join(str(e) for e in errors)}
+
+    parts = (
+        data.get("SearchResults", {}).get("Parts") or []
+    )
+
+    results = []
+    for p in parts:
+        results.append({
+            "mpn": p.get("ManufacturerPartNumber") or p.get("MouserPartNumber", ""),
+            "mouser_mpn": p.get("MouserPartNumber", ""),
+            "manufacturer": p.get("Manufacturer", ""),
+            "description": p.get("Description", ""),
+            "package": _extract_package(p.get("ImagePath", "")),
+            "stock_mouser": _parse_stock(p.get("Availability", "0")),
+            "price_usd_qty10": _price_at_qty(p.get("PriceBreaks", [])),
+            "lead_time": p.get("LeadTime") or None,
+            "lifecycle_status": p.get("LifecycleStatus") or None,
+            "suggested_replacement": p.get("SuggestedReplacement") or None,
+            "product_url": p.get("ProductDetailUrl") or None,
+            "datasheet_url": p.get("DataSheetUrl") or p.get("ProductDetailUrl") or None,
+            "kicad_footprint_hint": None,  # Mouser does not provide KiCad footprints
+        })
+
+    return {"status": "ok", "results": results}
+
+
+def _find_datasheet_url(mpn: str) -> tuple[str | None, str | None]:
+    """
+    Search Mouser for the MPN and return (datasheet_url, product_url).
+    Falls back to scraping the product page if the API returns no direct PDF link.
+    """
+    api_key = os.getenv("MOUSER_API_KEY", "").strip()
+    if not api_key:
+        return None, None
+
+    try:
+        resp = requests.post(
+            _MOUSER_SEARCH_URL,
+            params={"apiKey": api_key},
+            json={"SearchByKeywordRequest": {
+                "keyword": mpn,
+                "Records": 1,
+                "StartingRecord": 0,
+                "SearchOptions": "None",
+            }},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        parts = resp.json().get("SearchResults", {}).get("Parts") or []
+    except requests.RequestException:
+        return None, None
+
+    if not parts:
+        return None, None
+
+    p = parts[0]
+    ds_url = p.get("DataSheetUrl") or ""
+    product_url = p.get("ProductDetailUrl") or ""
+
+    if ds_url:
+        return ds_url, product_url
+
+    # Fallback: DuckDuckGo HTML search for a direct PDF datasheet
+    pdf_url = _duckduckgo_datasheet(mpn)
+    return pdf_url, product_url
+
+
+def _duckduckgo_datasheet(mpn: str) -> str | None:
+    """
+    Search DuckDuckGo for '{mpn} datasheet filetype:pdf' and return the first
+    direct PDF URL found. DuckDuckGo encodes result URLs as uddg= query params.
+    """
+    query = f"{mpn} datasheet filetype:pdf"
+    try:
+        resp = requests.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        resp.raise_for_status()
+    except requests.RequestException:
+        return None
+
+    # DuckDuckGo wraps result URLs: uddg=https%3A%2F%2F...
+    encoded = re.findall(r"uddg=(https?%3A%2F%2F[^&\"'\s]+)", resp.text)
+    for enc in encoded:
+        url = unquote(enc)
+        if url.lower().endswith(".pdf"):
+            return url
+
+    # Also try bare PDF URLs that might appear directly
+    bare = re.findall(r"https?://[^\s\"'<>&]+\.pdf", resp.text)
+    if bare:
+        return bare[0]
+
+    return None
+
+
+def _extract_sections(pdf_path: str) -> dict[str, str]:
+    """
+    Extract named text sections from the first 12 pages of a datasheet PDF.
+    Returns a dict of lowercased header keyword → block of text following it.
+    """
+    sections: dict[str, str] = {}
+    full_lines: list[str] = []
+
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages[:12]:
+            text = page.extract_text() or ""
+            full_lines.extend(text.splitlines())
+
+    # Walk lines, detect section starts, collect text blocks
+    current_key: str | None = None
+    buffer: list[str] = []
+
+    for line in full_lines:
+        lower = line.lower().strip()
+        matched = next((h for h in _SECTION_HEADERS if h in lower), None)
+        if matched and len(lower) < 120:          # avoid matching mid-sentence
+            if current_key and buffer:
+                sections[current_key] = "\n".join(buffer).strip()
+            current_key = matched
+            buffer = [line]
+        elif current_key:
+            buffer.append(line)
+
+    if current_key and buffer:
+        sections[current_key] = "\n".join(buffer).strip()
+
+    return sections
+
+
+def _parse_max_ratings(text: str) -> dict[str, str]:
+    """Best-effort extraction of parameter → value pairs from a max ratings block."""
+    ratings: dict[str, str] = {}
+    # Match lines like:  VCC  Supply Voltage  ..... 6.0 V
+    for line in text.splitlines():
+        # Look for a value+unit at the end of the line
+        m = re.search(r"([\-\d\.]+\s*(?:V|mA|A|MHz|°C|W|mW))", line)
+        if m:
+            label = re.sub(r"\s{2,}", " ", line[:m.start()]).strip(" .")
+            if label:
+                ratings[label] = m.group(1).strip()
+    return ratings
+
+
+def _parse_pins(text: str) -> list[dict]:
+    """Best-effort extraction of pin number + name + function rows."""
+    pins: list[dict] = []
+    for line in text.splitlines():
+        # Match patterns like: "1  VCC  Power supply"  or  "PC0 (ADC0)  I/O"
+        m = re.match(r"^\s*(\d{1,3})\s+([A-Z][A-Z0-9_/\(\)]{1,20})\s+(.*)", line)
+        if m:
+            pins.append({
+                "number": m.group(1),
+                "name": m.group(2).strip(),
+                "function": m.group(3).strip(),
+            })
+    return pins
 
 
 def get_datasheet(mpn: str, manufacturer: str | None = None) -> dict:
-    """Stub: Fetch and parse a component datasheet."""
+    """Fetch and parse a component datasheet PDF via Mouser, returning structured data."""
+    ds_dir = _datasheets_dir()
+    if ds_dir is None:
+        return {
+            "status": "error",
+            "message": "No project set. Call set_project(sch_file=...) first so datasheets are saved inside your project folder.",
+        }
+    safe_name = re.sub(r"[^\w\-]", "_", mpn) + ".pdf"
+    pdf_path = ds_dir / safe_name
+    cached = pdf_path.exists()
+
+    ds_url, product_url = None, None
+
+    if not cached:
+        ds_url, product_url = _find_datasheet_url(mpn)
+        if not ds_url:
+            return {
+                "status": "error",
+                "mpn": mpn,
+                "manufacturer": manufacturer,
+                "product_url": product_url,
+                "message": (
+                    "No datasheet PDF found via Mouser. "
+                    "Check product_url manually if set."
+                ),
+            }
+
+        # Download and save
+        try:
+            pdf_resp = requests.get(ds_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            pdf_resp.raise_for_status()
+        except requests.RequestException as exc:
+            return {"status": "error", "mpn": mpn, "message": f"Failed to download datasheet: {exc}"}
+
+        content = pdf_resp.content
+        if not content[:4] == b"%PDF":
+            return {"status": "error", "mpn": mpn, "message": "URL did not return a valid PDF"}
+        pdf_path.write_bytes(content)
+
+    with pdfplumber.open(pdf_path) as pdf:
+        page_count = len(pdf.pages)
+
+    sections = _extract_sections(str(pdf_path))
+
+    max_ratings = _parse_max_ratings(
+        sections.get("absolute maximum") or sections.get("maximum ratings") or ""
+    )
+    pins = _parse_pins(
+        sections.get("pin description") or sections.get("pin function") or sections.get("pinout") or ""
+    )
+
+    # Extract recommended footprint from package section or max-ratings text
+    footprint_hint = None
+    pkg_text = sections.get("package") or ""
+    for pkg in ("TQFP-32", "DIP-28", "QFN-32", "SOIC-28", "PDIP-28"):
+        if pkg.lower() in (sections.get("absolute maximum", "") + pkg_text).lower():
+            footprint_hint = pkg
+            break
+
+    decoupling = ""
+    for key in ("decoupling", "bypass capacitor"):
+        if key in sections:
+            # Grab the first meaningful sentence
+            first = next((l for l in sections[key].splitlines() if len(l) > 20), "")
+            decoupling = first
+            break
+
+    layout_notes = ""
+    for key in ("typical application", "recommended circuit", "application circuit"):
+        if key in sections:
+            first = next((l for l in sections[key].splitlines() if len(l) > 20), "")
+            layout_notes = first
+            break
+
     return {
         "status": "ok",
-        "note": "STUB — wire up a real datasheet fetch/parse pipeline",
         "mpn": mpn,
-        "manufacturer": manufacturer or "Unknown",
-        "pins": [],
-        "recommended_footprint": "Package_TO_SOT_SMD:SOT-23",
-        "decoupling_recommendation": "100nF ceramic on each VCC pin",
-        "layout_notes": "Keep decoupling caps within 2mm of power pins.",
-        "max_ratings": {},
+        "manufacturer": manufacturer,
+        "datasheet_url": ds_url,
+        "product_url": product_url,
+        "saved_path": str(pdf_path),
+        "cached": cached,
+        "page_count": page_count,
+        "pins": pins,
+        "max_ratings": max_ratings,
+        "recommended_footprint": footprint_hint,
+        "decoupling_recommendation": decoupling or None,
+        "layout_notes": layout_notes or None,
+        "raw_sections": {k: v[:800] for k, v in sections.items()},  # truncated for readability
     }
 
 
