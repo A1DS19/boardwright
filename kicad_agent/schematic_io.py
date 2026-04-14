@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path
 
 from .sexpr import SExpr, _parse_sexpr, _sx_find, _sx_findall, _sx_get_property
+from .state import _kicad_lib_search_paths
 
 
 def _parse_sch_file(sch_file: str) -> SExpr:
@@ -255,24 +256,33 @@ def _append_to_sch(sch_file: str, sexp_text: str) -> None:
 # Library symbol embedding (for add_symbol writing to disk)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _kicad_sym_search_paths() -> list[Path]:
+_DOWNLOAD_HINT = (
+    "Please download the KiCad symbol (.kicad_sym) from one of: "
+    "https://www.snapeda.com, https://componentsearchengine.com, or https://www.ultralibrarian.com. "
+    "Save the file into the project's 'symbols/' folder, then tell me: "
+    "(1) the filename you saved it as (without .kicad_sym) — this is the library name; "
+    "(2) the symbol name inside the file (usually shown in the download page or visible "
+    "when you open the file in a text editor as the value after '(symbol \"')."
+)
+
+_FOOTPRINT_DOWNLOAD_HINT = (
+    "Please download the KiCad footprint (.kicad_mod) from one of: "
+    "https://www.snapeda.com, https://componentsearchengine.com, or https://www.ultralibrarian.com. "
+    "Save the file into the project's 'footprints/' folder, then tell me: "
+    "(1) the filename you saved it as (without .kicad_mod) — this is the footprint name; "
+    "(2) the footprint name inside the file if it differs (visible after '(footprint \"' "
+    "at the top of the file)."
+)
+
+
+def _kicad_sym_search_paths(project_dir: "Path | None" = None) -> list[Path]:
     """Return candidate directories to search for .kicad_sym library files."""
-    candidates: list[Path] = []
-    env = os.environ.get("KICAD_SYMBOLS")
-    if env:
-        candidates.append(Path(env))
-    candidates += [
-        Path("/usr/share/kicad/symbols"),
-        Path("/usr/local/share/kicad/symbols"),
-        Path(os.path.expanduser("~/.local/share/kicad/symbols")),
-        Path("/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols"),
-    ]
-    return [p for p in candidates if p.is_dir()]
+    return _kicad_lib_search_paths("symbols", "KICAD_SYMBOLS", project_dir)
 
 
-def _find_lib_file(library: str) -> Path | None:
+def _find_lib_file(library: str, project_dir: "Path | None" = None) -> Path | None:
     """Find {library}.kicad_sym in the standard KiCad library search paths."""
-    for search_dir in _kicad_sym_search_paths():
+    for search_dir in _kicad_sym_search_paths(project_dir):
         candidate = search_dir / f"{library}.kicad_sym"
         if candidate.is_file():
             return candidate
@@ -305,15 +315,16 @@ def _extract_raw_symbol(lib_text: str, symbol_name: str) -> str | None:
 
 def _prefix_symbol_names(raw_text: str, sym_name: str, lib_name: str) -> str:
     """
-    Prefix only the top-level (symbol "NAME") entry with lib_name:.
-    KiCad 9 requires the top-level symbol in lib_symbols to be named
-    "lib:sym", but sub-unit entries like (symbol "NAME_0_1") must keep
-    their original names without any library prefix.
+    Prefix the top-level (symbol "NAME") entry and any (extends "NAME") reference
+    with lib_name:. Sub-unit entries like (symbol "NAME_0_1") are left unchanged.
+    KiCad requires both declarations and extends references to use "lib:name" form
+    when embedded in a schematic's lib_symbols block.
     """
-    pattern = re.compile(
-        r'\(symbol "(' + re.escape(sym_name) + r')"'
-    )
-    return pattern.sub(lambda m: f'(symbol "{lib_name}:{m.group(1)}"', raw_text)
+    sym_pattern = re.compile(r'\(symbol "(' + re.escape(sym_name) + r')"')
+    result = sym_pattern.sub(lambda m: f'(symbol "{lib_name}:{m.group(1)}"', raw_text)
+    ext_pattern = re.compile(r'\(extends "(' + re.escape(sym_name) + r')"')
+    result = ext_pattern.sub(lambda m: f'(extends "{lib_name}:{m.group(1)}"', result)
+    return result
 
 
 def _sch_top_uuid(sch_file: str) -> str:
@@ -331,23 +342,27 @@ def _ensure_lib_symbol_embedded(sch_file: str, library: str, symbol: str) -> str
     """
     lib_id = f"{library}:{symbol}"
     path = Path(sch_file)
+    project_dir = path.parent
     content = path.read_text(encoding="utf-8")
 
     if f'(symbol "{lib_id}"' in content:
         return None  # already embedded
 
-    lib_file = _find_lib_file(library)
+    lib_file = _find_lib_file(library, project_dir)
     if lib_file is None:
-        search_dirs = [str(p) for p in _kicad_sym_search_paths()]
+        search_dirs = [str(p) for p in _kicad_sym_search_paths(project_dir)]
         return (
             f"Library '{library}' not found in: {search_dirs}. "
-            "Set the KICAD_SYMBOLS environment variable to the correct path."
+            f"{_DOWNLOAD_HINT}"
         )
 
     lib_text = lib_file.read_text(encoding="utf-8")
     raw_sym = _extract_raw_symbol(lib_text, symbol)
     if raw_sym is None:
-        return f"Symbol '{symbol}' not found in library '{library}' ({lib_file})."
+        return (
+            f"Symbol '{symbol}' not found in library '{library}' ({lib_file}). "
+            f"{_DOWNLOAD_HINT}"
+        )
 
     # If this symbol extends a parent, embed the parent first so KiCad can
     # resolve the inheritance chain (both must be present in lib_symbols).

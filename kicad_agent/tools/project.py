@@ -41,7 +41,7 @@ def set_drc_severity(rule_type: str, severity: str) -> dict:
             "new_severity": severity,
             "file": str(pro_file),
         }
-    except Exception as e:
+    except (OSError, json.JSONDecodeError, ValueError) as e:
         return {"status": "error", "message": str(e)}
 
 
@@ -84,7 +84,7 @@ def add_drc_exclusion(
             "dru_file": str(dru_file),
             "note": "Reload the PCB in KiCad (or run DRC again) to apply.",
         }
-    except Exception as e:
+    except OSError as e:
         return {"status": "error", "message": str(e)}
 
 

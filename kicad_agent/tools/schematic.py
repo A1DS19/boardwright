@@ -133,7 +133,7 @@ def connect_pins(
                 "to":   {"ref": to_ref,   "pin": to_pin,   "x": x2, "y": y2},
                 "segments_written": 1 if abs(x1 - x2) < 0.001 or abs(y1 - y2) < 0.001 else 2,
             }
-        except Exception as e:
+        except (OSError, ValueError) as e:
             return {"status": "error", "message": f"Failed to write wire: {e}"}
 
     # In-memory fallback (no sch_file set)
@@ -188,7 +188,7 @@ def add_net_label(
     if sch:
         try:
             _append_to_sch(sch, _label_sexp(net_name, lx, ly, rotation))
-        except Exception as e:
+        except (OSError, ValueError) as e:
             return {"status": "error", "message": f"Failed to write label: {e}"}
         return {"status": "ok", "source": "kicad_sch",
                 "net_name": net_name, "x": lx, "y": ly, "rotation": rotation}
@@ -214,7 +214,7 @@ def add_no_connect(reference: str, pin: str, sheet: str) -> dict:
             }
         try:
             _append_to_sch(sch, _no_connect_sexp(pos[0], pos[1]))
-        except Exception as e:
+        except (OSError, ValueError) as e:
             return {"status": "error", "message": f"Failed to write no-connect: {e}"}
         return {"status": "ok", "source": "kicad_sch",
                 "reference": reference, "pin": pin, "x": pos[0], "y": pos[1]}
@@ -295,7 +295,7 @@ def get_pin_positions(reference: str, sheet: str) -> dict:
                 "coordinate_space": "schematic (Y-inversion applied)",
                 "pins": pins_out,
             }
-        except Exception as e:
+        except (OSError, ValueError) as e:
             return {"status": "error", "message": f"Failed to read schematic: {e}"}
 
     # In-memory fallback

@@ -30,7 +30,7 @@ def run_drc(rules_preset: str = "default") -> dict:
 
     try:
         raw = json.loads(Path(out).read_text())
-    except Exception:
+    except (json.JSONDecodeError, OSError):
         return _cli_error(stderr, rc)
     finally:
         Path(out).unlink(missing_ok=True)

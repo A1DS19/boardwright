@@ -6,7 +6,7 @@ import json
 import tempfile
 from pathlib import Path
 
-from ..backends import _kicad, _run_cli
+from ..backends import _kicad, _run_cli, _try_kipy
 from ..state import _pcb_file, _project_state
 
 
@@ -66,13 +66,12 @@ def place_footprint(
     Move a footprint to the given position via kipy IPC.
     KiCad must be running with the PCB open. Falls back to in-memory stub if not.
     """
-    try:
+    def _kipy_place():
         kicad = _kicad()
         from kipy.geometry import Vector2, Angle
         from kipy.board_types import BoardLayer
 
         board = kicad.get_board()
-
         fps = board.get_footprints()
         fp = next(
             (f for f in fps if f.reference_field.text.value == reference),
@@ -88,7 +87,6 @@ def place_footprint(
 
         board.update_items(fp)
         board.save()
-
         return {
             "status": "ok",
             "source": "kipy",
@@ -103,15 +101,9 @@ def place_footprint(
             },
         }
 
-    except ImportError:
-        pass
-    except Exception as e:
-        if "connect" in str(e).lower() or "socket" in str(e).lower():
-            return {
-                "status": "error",
-                "message": "KiCad is not running. Open the PCB in KiCad then retry.",
-            }
-        return {"status": "error", "message": f"kipy error: {e}"}
+    result = _try_kipy(_kipy_place)
+    if result is not None:
+        return result
 
     # Stub fallback
     _project_state["placements"][reference] = {
@@ -129,7 +121,7 @@ def place_footprint(
 
 def get_ratsnest(net_filter: str | None = None) -> dict:
     """Return nets and unconnected count via kipy IPC."""
-    try:
+    def _kipy_ratsnest():
         kicad = _kicad()
         board = kicad.get_board()
         nets = board.get_nets()
@@ -150,7 +142,7 @@ def get_ratsnest(net_filter: str | None = None) -> dict:
             try:
                 raw = json.loads(Path(out).read_text())
                 unconnected_count = len(raw.get("unconnected_items", []))
-            except Exception:
+            except (json.JSONDecodeError, OSError):
                 pass
             finally:
                 Path(out).unlink(missing_ok=True)
@@ -163,15 +155,9 @@ def get_ratsnest(net_filter: str | None = None) -> dict:
             "nets": net_list,
         }
 
-    except ImportError:
-        pass
-    except Exception as e:
-        if "connect" in str(e).lower() or "socket" in str(e).lower():
-            return {
-                "status": "error",
-                "message": "KiCad is not running. Open the PCB in KiCad then retry.",
-            }
-        return {"status": "error", "message": f"kipy error: {e}"}
+    result = _try_kipy(_kipy_ratsnest)
+    if result is not None:
+        return result
 
     # Stub fallback
     placed = set(_project_state["placements"].keys())
@@ -229,24 +215,17 @@ def add_zone(
 
 def fill_zones() -> dict:
     """Refill all copper zones via kipy IPC."""
-    try:
+    def _kipy_fill():
         kicad = _kicad()
         board = kicad.get_board()
         board.refill_zones()
         board.save()
-
         zone_count = len(board.get_zones())
         return {"status": "ok", "source": "kipy", "zones_filled": zone_count}
 
-    except ImportError:
-        pass
-    except Exception as e:
-        if "connect" in str(e).lower() or "socket" in str(e).lower():
-            return {
-                "status": "error",
-                "message": "KiCad is not running. Open the PCB in KiCad then retry.",
-            }
-        return {"status": "error", "message": f"kipy error: {e}"}
+    result = _try_kipy(_kipy_fill)
+    if result is not None:
+        return result
 
     # Stub fallback
     filled = sum(1 for z in _project_state["zones"] if z.get("type") == "copper")

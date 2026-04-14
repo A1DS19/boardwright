@@ -13,12 +13,13 @@ import pdfplumber
 import requests
 from dotenv import load_dotenv
 
-from ..state import _project_state
+from ..state import _kicad_lib_search_paths, _project_state
 
 load_dotenv()
 
 _MOUSER_SEARCH_URL = "https://api.mouser.com/api/v1/search/keyword"
 _DATASHEET_FOLDER = "mcp_kicad_datasheets"
+_REQUEST_TIMEOUT = 10  # seconds for external HTTP requests
 
 
 def _datasheets_dir() -> Path | None:
@@ -122,7 +123,7 @@ def search_components(
             _MOUSER_SEARCH_URL,
             params={"apiKey": api_key},
             json=payload,
-            timeout=10,
+            timeout=_REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
     except requests.RequestException as exc:
@@ -177,7 +178,7 @@ def _find_datasheet_url(mpn: str) -> tuple[str | None, str | None]:
                 "StartingRecord": 0,
                 "SearchOptions": "None",
             }},
-            timeout=10,
+            timeout=_REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
         parts = resp.json().get("SearchResults", {}).get("Parts") or []
@@ -209,7 +210,7 @@ def _duckduckgo_datasheet(mpn: str) -> str | None:
         resp = requests.get(
             "https://html.duckduckgo.com/html/",
             params={"q": query},
-            timeout=10,
+            timeout=_REQUEST_TIMEOUT,
             headers={"User-Agent": "Mozilla/5.0"},
         )
         resp.raise_for_status()
@@ -324,13 +325,14 @@ def get_datasheet(mpn: str, manufacturer: str | None = None) -> dict:
 
         # Download and save
         try:
-            pdf_resp = requests.get(ds_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            pdf_resp = requests.get(ds_url, timeout=_REQUEST_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
             pdf_resp.raise_for_status()
         except requests.RequestException as exc:
             return {"status": "error", "mpn": mpn, "message": f"Failed to download datasheet: {exc}"}
 
+        content_type = pdf_resp.headers.get("Content-Type", "")
         content = pdf_resp.content
-        if not content[:4] == b"%PDF":
+        if not content[:4] == b"%PDF" and "pdf" not in content_type.lower():
             return {"status": "error", "mpn": mpn, "message": "URL did not return a valid PDF"}
         pdf_path.write_bytes(content)
 
@@ -387,24 +389,51 @@ def get_datasheet(mpn: str, manufacturer: str | None = None) -> dict:
     }
 
 
+def _kicad_fp_search_paths(project_dir: "Path | None" = None) -> list[Path]:
+    """Return candidate directories to search for KiCad footprint libraries (.pretty)."""
+    return _kicad_lib_search_paths("footprints", "KICAD_FOOTPRINTS", project_dir)
+
+
+_FP_DOWNLOAD_HINT = (
+    "Please download the KiCad footprint (.kicad_mod) from one of: "
+    "https://www.snapeda.com, https://componentsearchengine.com, or https://www.ultralibrarian.com. "
+    "Save the file into the project's 'footprints/' folder, then tell me: "
+    "(1) the filename you saved it as (without .kicad_mod) — this is the footprint name; "
+    "(2) the footprint name inside the file if it differs (visible after '(footprint \"' "
+    "at the top of the file)."
+)
+
+
 def verify_kicad_footprint(library: str, footprint: str) -> dict:
-    """Stub: Check whether a footprint exists in the KiCad standard libraries."""
+    """Check whether a footprint exists in the KiCad libraries or project footprints/."""
     full_path = f"{library}:{footprint}"
-    known_prefixes = (
-        "Resistor_SMD", "Capacitor_SMD", "Package_TO_SOT_SMD",
-        "Package_SO", "Package_DFN_QFN", "Connector_USB",
-        "Connector_JST", "RF_Module",
+
+    pcb_file = _project_state.get("pcb_file")
+    sch_file = _project_state.get("sch_file")
+    project_dir = Path(pcb_file).parent if pcb_file else (
+        Path(sch_file).parent if sch_file else None
     )
-    found = any(library.startswith(p) for p in known_prefixes)
+
+    for search_dir in _kicad_fp_search_paths(project_dir):
+        # Footprint libraries are .pretty directories containing .kicad_mod files
+        lib_dir = search_dir / f"{library}.pretty"
+        if lib_dir.is_dir():
+            mod_file = lib_dir / f"{footprint}.kicad_mod"
+            if mod_file.is_file():
+                return {"status": "ok", "found": True, "full_path": full_path}
+        # Also allow a flat footprints/ folder with bare .kicad_mod files
+        mod_file = search_dir / f"{footprint}.kicad_mod"
+        if mod_file.is_file():
+            return {"status": "ok", "found": True, "full_path": full_path}
+
     return {
         "status": "ok",
-        "found": found,
-        "full_path": full_path if found else None,
-        "close_matches": [] if found else [
-            f"{library}:{footprint}_HandSoldering",
-            f"{library}:{footprint.split('_')[0]}",
-        ],
-        "note": "STUB — replace with real KiCad library lookup",
+        "found": False,
+        "full_path": None,
+        "message": (
+            f"Footprint '{full_path}' not found in any KiCad library or project "
+            f"footprints/ folder. {_FP_DOWNLOAD_HINT}"
+        ),
     }
 
 
@@ -419,14 +448,15 @@ def generate_custom_footprint(
     pad_height_mm: float | None = None,
     courtyard_margin_mm: float = 0.5,
 ) -> dict:
-    """Stub: Generate a .kicad_mod file from land-pattern dimensions."""
-    fp_name = f"Custom_{reference}_{package_type}_{pad_count}pad"
+    """Generate a .kicad_mod file from land-pattern dimensions (not yet implemented)."""
     return {
-        "status": "ok",
-        "note": "STUB — replace with real footprint generator",
-        "footprint_name": fp_name,
-        "library_path": f"[project]:{fp_name}",
-        "kicad_mod_written": False,
+        "status": "error",
+        "message": (
+            "Custom footprint generation is not yet implemented. "
+            "Please download a footprint from https://www.snapeda.com, "
+            "https://componentsearchengine.com, or https://www.ultralibrarian.com "
+            "and place it in the project's 'footprints/' folder."
+        ),
     }
 
 
