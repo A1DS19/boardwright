@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import math
 import os
 import re
@@ -387,25 +388,80 @@ def get_datasheet(mpn: str, manufacturer: str | None = None) -> dict:
     }
 
 
-def verify_kicad_footprint(library: str, footprint: str) -> dict:
-    """Stub: Check whether a footprint exists in the KiCad standard libraries."""
-    full_path = f"{library}:{footprint}"
-    known_prefixes = (
-        "Resistor_SMD", "Capacitor_SMD", "Package_TO_SOT_SMD",
-        "Package_SO", "Package_DFN_QFN", "Connector_USB",
-        "Connector_JST", "RF_Module",
+def _find_fp_lib_tables() -> list[Path]:
+    """Return fp-lib-table paths to consult, in priority order (project, user)."""
+    tables: list[Path] = []
+    from ..state import _pcb_file
+    pcb = _pcb_file()
+    if pcb:
+        proj_tbl = Path(pcb).parent / "fp-lib-table"
+        if proj_tbl.exists():
+            tables.append(proj_tbl)
+    user_cfg = Path.home() / ".config" / "kicad"
+    if user_cfg.exists():
+        for sub in sorted(user_cfg.iterdir(), reverse=True):
+            t = sub / "fp-lib-table"
+            if t.exists():
+                tables.append(t)
+                break
+    return tables
+
+
+def _parse_fp_lib_table(path: Path) -> dict[str, str]:
+    """Return {nickname: expanded-uri} from an fp-lib-table file."""
+    text = path.read_text()
+    pairs = re.findall(
+        r'\(name\s+"([^"]+)"\)\s*\(type\s+"[^"]+"\)\s*\(uri\s+"([^"]+)"\)',
+        text,
     )
-    found = any(library.startswith(p) for p in known_prefixes)
-    return {
-        "status": "ok",
-        "found": found,
-        "full_path": full_path if found else None,
-        "close_matches": [] if found else [
-            f"{library}:{footprint}_HandSoldering",
-            f"{library}:{footprint.split('_')[0]}",
-        ],
-        "note": "STUB — replace with real KiCad library lookup",
+    default_fp = "/usr/share/kicad/footprints"
+    env = {
+        "KICAD9_FOOTPRINT_DIR": os.environ.get("KICAD9_FOOTPRINT_DIR", default_fp),
+        "KICAD8_FOOTPRINT_DIR": os.environ.get("KICAD8_FOOTPRINT_DIR", default_fp),
+        "KICAD7_FOOTPRINT_DIR": os.environ.get("KICAD7_FOOTPRINT_DIR", default_fp),
+        "KIPRJMOD": os.environ.get("KIPRJMOD", ""),
     }
+    def expand(u: str) -> str:
+        for k, v in env.items():
+            u = u.replace("${" + k + "}", v)
+        return u
+    return {nick: expand(uri) for nick, uri in pairs}
+
+
+def verify_kicad_footprint(library: str, footprint: str) -> dict:
+    """Check whether a footprint exists on disk in a resolvable KiCad library."""
+    tables = _find_fp_lib_tables()
+    if not tables:
+        return {"status": "error",
+                "message": "No fp-lib-table found (checked project dir and ~/.config/kicad/*)."}
+
+    libs: dict[str, str] = {}
+    for t in tables:
+        for k, v in _parse_fp_lib_table(t).items():
+            libs.setdefault(k, v)
+
+    if library not in libs:
+        close = difflib.get_close_matches(library, list(libs.keys()), n=5, cutoff=0.5)
+        return {"status": "ok", "found": False,
+                "reason": f"Library '{library}' not in fp-lib-table.",
+                "close_library_matches": close}
+
+    lib_dir = Path(libs[library])
+    if not lib_dir.exists():
+        return {"status": "ok", "found": False,
+                "reason": f"Library dir does not exist: {lib_dir}"}
+
+    mod_file = lib_dir / f"{footprint}.kicad_mod"
+    if mod_file.exists():
+        return {"status": "ok", "found": True,
+                "full_path": f"{library}:{footprint}",
+                "file": str(mod_file)}
+
+    available = [p.stem for p in lib_dir.glob("*.kicad_mod")]
+    close = difflib.get_close_matches(footprint, available, n=8, cutoff=0.5)
+    return {"status": "ok", "found": False,
+            "reason": f"No '{footprint}.kicad_mod' in {lib_dir}.",
+            "close_footprint_matches": [f"{library}:{m}" for m in close]}
 
 
 def generate_custom_footprint(

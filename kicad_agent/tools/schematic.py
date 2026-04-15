@@ -19,6 +19,7 @@ from ..schematic_io import (
     _no_connect_sexp,
     _parse_sch_file,
     _place_symbol,
+    _remove_placed_symbol,
     _resolve_pin_endpoint,
     _sch_lib_symbols,
     _sch_placed_symbols,
@@ -56,18 +57,25 @@ def add_symbol(
     sheet: str,
     rotation: float = 0,
     mirror_x: bool = False,
+    footprint: str = "",
 ) -> dict:
     sch = _sch_file()
     if sch:
-        err = _place_symbol(sch, library, symbol, reference, value, x, y, rotation, mirror_x)
+        err = _place_symbol(sch, library, symbol, reference, value, x, y, rotation, mirror_x,
+                            footprint=footprint)
         if err:
             return {"status": "error", "message": err}
-        _project_state["bom"][reference] = {"value": value, "library": library, "symbol": symbol}
+        _project_state["bom"][reference] = {
+            "value": value, "library": library, "symbol": symbol, "footprint": footprint,
+        }
+        if footprint:
+            _project_state["footprints"][reference] = footprint
         return {
             "status": "ok",
             "source": "kicad_sch",
             "reference": reference,
             "lib_id": f"{library}:{symbol}",
+            "footprint": footprint or None,
             "sheet": sheet,
         }
 
@@ -81,6 +89,35 @@ def add_symbol(
     })
     _project_state["bom"][reference] = {"value": value, "library": library, "symbol": symbol}
     return {"status": "ok", "source": "stub", "reference": reference, "sheet": sheet}
+
+
+def remove_symbol(reference: str) -> dict:
+    """
+    Remove a placed symbol instance from the schematic by reference designator.
+    Also prunes the lib_symbols entry if no other instance uses the same lib_id.
+    Leaves wires/labels intact — re-run connect_pins after replacing the symbol.
+    """
+    sch = _sch_file()
+    if not sch:
+        if reference in _project_state.get("bom", {}):
+            _project_state["bom"].pop(reference, None)
+            return {"status": "ok", "source": "stub", "reference": reference}
+        return {"status": "error", "message": f"Reference '{reference}' not found."}
+
+    removed, removed_lib_id = _remove_placed_symbol(sch, reference)
+    if not removed:
+        return {"status": "error",
+                "message": f"No placed symbol with reference '{reference}' in {sch}."}
+
+    _project_state.get("bom", {}).pop(reference, None)
+    _project_state.get("footprints", {}).pop(reference, None)
+
+    return {
+        "status": "ok",
+        "source": "kicad_sch",
+        "reference": reference,
+        "lib_symbols_pruned": removed_lib_id,
+    }
 
 
 def add_power_symbol(net_name: str, x: float, y: float, sheet: str) -> dict:
@@ -490,6 +527,7 @@ def _stub_erc(scope: str) -> dict:
 HANDLERS = {
     "create_schematic_sheet": create_schematic_sheet,
     "add_symbol":             add_symbol,
+    "remove_symbol":          remove_symbol,
     "add_power_symbol":       add_power_symbol,
     "connect_pins":           connect_pins,
     "add_net_label":          add_net_label,
@@ -532,9 +570,22 @@ TOOL_SCHEMAS = [
                 "y":          {"type": "number"},
                 "rotation":   {"type": "number", "default": 0},
                 "mirror_x":   {"type": "boolean", "default": False},
-                "sheet":      {"type": "string"}
+                "sheet":      {"type": "string"},
+                "footprint":  {"type": "string",
+                               "description": "Optional 'Lib:Name' footprint, e.g. 'Resistor_SMD:R_0603_1608Metric'. Populates the Footprint property so Update-PCB-from-Schematic pulls it in."}
             },
             "required": ["library", "symbol", "reference", "value", "x", "y", "sheet"]
+        }
+    },
+    {
+        "name": "remove_symbol",
+        "description": "Remove a placed schematic symbol by reference designator. Also prunes the lib_symbols cache entry when no other instance uses it — use before re-adding with a different lib_id to avoid stale definitions. Does not delete wires or labels connected to it.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reference": {"type": "string", "description": "e.g. RN1, U3"}
+            },
+            "required": ["reference"]
         }
     },
     {

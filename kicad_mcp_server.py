@@ -24,13 +24,28 @@ from kicad_agent import TOOLS, dispatch_tool
 server = Server("kicad")
 
 
+def _relax_scalars(schema: dict) -> dict:
+    """Broaden number/integer/boolean property types to also accept strings,
+    so clients that serialize scalar args as strings (e.g. XML-param harnesses)
+    pass MCP-side JSONSchema validation. Dispatcher coerces back to the real
+    type before invoking the handler."""
+    props = (schema or {}).get("properties") or {}
+    for spec in props.values():
+        if not isinstance(spec, dict):
+            continue
+        t = spec.get("type")
+        if isinstance(t, str) and t in ("number", "integer", "boolean"):
+            spec["type"] = [t, "string"]
+    return schema
+
+
 @server.list_tools()
 async def list_tools() -> list[types.Tool]:
     return [
         types.Tool(
             name=t["name"],
             description=t["description"],
-            inputSchema=t["input_schema"],
+            inputSchema=_relax_scalars(json.loads(json.dumps(t["input_schema"]))),
         )
         for t in TOOLS
     ]

@@ -154,8 +154,11 @@ def get_capabilities() -> dict:
                 "import_error": kipy_import_error,
             },
             "schematic_file_editing": {
-                "available": bool(sch_file and Path(sch_file).exists()),
+                "available": True,
+                "requires_active_sch_file": True,
+                "active_sch_file_loaded": bool(sch_file and Path(sch_file).exists()),
                 "used_for": ["connect_pins", "add_net_label", "add_no_connect", "get_pin_positions"],
+                "note": "Pure-Python s-expression editor; always available. Call set_project with an existing .kicad_sch (or create_sch_if_missing=true) to enable edits.",
             },
             "stub_fallback": {
                 "available": True,

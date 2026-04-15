@@ -104,5 +104,48 @@ kicad-ai-project-creator/
 
 Call `get_capabilities` first in a session to see what is available on the current machine and whether `pcb_file`/`sch_file` are set.
 
+### Enabling the KiCad IPC API
+
+Live PCB tools (`place_footprint`, `route_trace`, `get_ratsnest`, `fill_zones`, `add_via`, etc.) talk to KiCad over the `kipy` IPC socket. For these to work:
+
+1. **Enable the API once**: KiCad → Preferences → Preferences → Plugins → check **"Enable KiCad API"**, then restart KiCad.
+2. **Open the PCB Editor**: launching the KiCad project manager alone is not enough — double-click the `.kicad_pcb` so the PCB Editor window is open.
+3. **Set the active project**: call `set_project` with absolute paths to the `.kicad_pcb` / `.kicad_sch`.
+4. **Sync footprints before placing**: footprints must exist on the board (Schematic Editor → Tools → *Update PCB from Schematic*, or `assign_footprint` + update) before `place_footprint` can move them.
+
+If a live tool returns `"KiCad is not running"`, the PCB Editor isn't open or the API isn't enabled.
+
+### Freerouting (autorouter) — Fedora setup
+
+KiCad's **Freerouting plugin** (install via *Tools → Plugin and Content Manager*) ships a Java jar that needs **Java 21** specifically. Java 25 runs but silently produces a 0-byte `.ses` file, which KiCad then fails to import with `Expecting '(' in ... offset 1`.
+
+```bash
+sudo dnf install java-21-openjdk-headless
+```
+
+Launch KiCad with `JAVA_HOME` pointing at 21 so the plugin picks it up:
+
+```bash
+JAVA_HOME=/usr/lib/jvm/java-21-openjdk kicad &
+```
+
+Make it permanent:
+
+```bash
+echo 'export JAVA_HOME=/usr/lib/jvm/java-21-openjdk' >> ~/.zshrc
+```
+
+If you want to autoroute manually (skipping the plugin):
+
+```bash
+cd <project-dir>
+/usr/lib/jvm/java-21-openjdk/bin/java -jar \
+  ~/.local/share/kicad/9.0/3rdparty/plugins/app_freerouting_kicad-plugin/jar/freerouting-2.1.0.jar \
+  -de freerouting.dsn -do freerouting.ses -mt 1 \
+  -host "KiCad's Pcbnew,9.0.8-1.fc43"
+```
+
+Use `-mt 1` — Freerouting's multi-threaded optimizer is known to create clearance violations. Then re-import in pcbnew: **File → Import → Specctra Session**.
+
 Each function must return a JSON-serialisable `dict` with `{"status": "ok"}` on
 success or `{"status": "error", "message": "..."}` on failure.

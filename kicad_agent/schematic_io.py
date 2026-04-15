@@ -236,6 +236,97 @@ def _no_connect_sexp(x: float, y: float) -> str:
     )
 
 
+def _find_matching_paren(text: str, open_idx: int) -> int:
+    """Given an index pointing at '(', return index of the matching ')'. -1 on mismatch."""
+    depth = 0
+    i = open_idx
+    in_str = False
+    while i < len(text):
+        c = text[i]
+        if c == '"' and text[i - 1] != "\\":
+            in_str = not in_str
+        elif not in_str:
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+        i += 1
+    return -1
+
+
+def _remove_placed_symbol(sch_file: str, reference: str) -> tuple[bool, str | None]:
+    """
+    Remove the top-level (symbol ...) instance whose Reference property matches.
+    Also removes the matching (symbol "LIB:NAME" ...) from (lib_symbols ...) if
+    no other instance references it. Creates a .bak before writing.
+    Returns (removed_instance, removed_lib_id_or_None).
+    """
+    path = Path(sch_file)
+    text = path.read_text(encoding="utf-8")
+
+    # Find every top-level "(symbol " occurrence outside lib_symbols.
+    lib_block_start = text.find("(lib_symbols")
+    lib_block_end = _find_matching_paren(text, lib_block_start) if lib_block_start != -1 else -1
+
+    target_start = target_end = -1
+    target_lib_id: str | None = None
+    search = 0
+    pat = re.compile(r'\(symbol\s')
+    for m in pat.finditer(text):
+        s = m.start()
+        # Skip anything inside (lib_symbols ...)
+        if lib_block_start != -1 and lib_block_start < s < lib_block_end:
+            continue
+        e = _find_matching_paren(text, s)
+        if e == -1:
+            continue
+        block = text[s:e + 1]
+        ref_m = re.search(r'\(property\s+"Reference"\s+"([^"]+)"', block)
+        if ref_m and ref_m.group(1) == reference:
+            lib_m = re.search(r'\(lib_id\s+"([^"]+)"\)', block)
+            target_lib_id = lib_m.group(1) if lib_m else None
+            target_start, target_end = s, e
+            break
+
+    if target_start == -1:
+        return False, None
+
+    # Drop the symbol instance (and the newline/whitespace before it, for tidiness).
+    pre = text[:target_start]
+    # Trim trailing whitespace (tab/newline) before the block so we don't leave blank lines
+    pre = re.sub(r'[\t ]*\n?$', '', pre)
+    post = text[target_end + 1:]
+    new_text = pre + "\n" + post.lstrip("\n")
+
+    # Decide whether to also drop the lib_symbols entry: only if no other placed
+    # instance uses the same lib_id.
+    removed_lib_id = None
+    if target_lib_id and f'(lib_id "{target_lib_id}")' not in new_text:
+        # Locate the (symbol "LIB:NAME" ...) inside (lib_symbols ...) in new_text.
+        new_lib_start = new_text.find("(lib_symbols")
+        new_lib_end = _find_matching_paren(new_text, new_lib_start) if new_lib_start != -1 else -1
+        if new_lib_start != -1 and new_lib_end != -1:
+            lib_region = new_text[new_lib_start:new_lib_end + 1]
+            entry_pat = re.compile(
+                r'\(symbol\s+"' + re.escape(target_lib_id) + r'"'
+            )
+            em = entry_pat.search(lib_region)
+            if em:
+                entry_abs_start = new_lib_start + em.start()
+                entry_abs_end = _find_matching_paren(new_text, entry_abs_start)
+                if entry_abs_end != -1:
+                    lib_pre = re.sub(r'[\t ]*\n?$', '', new_text[:entry_abs_start])
+                    lib_post = new_text[entry_abs_end + 1:].lstrip("\n")
+                    new_text = lib_pre + "\n" + lib_post
+                    removed_lib_id = target_lib_id
+
+    path.with_suffix(".kicad_sch.bak").write_text(text, encoding="utf-8")
+    path.write_text(new_text, encoding="utf-8")
+    return True, removed_lib_id
+
+
 def _append_to_sch(sch_file: str, sexp_text: str) -> None:
     """
     Insert sexp_text into the .kicad_sch file just before the final closing paren.
@@ -316,6 +407,101 @@ def _prefix_symbol_names(raw_text: str, sym_name: str, lib_name: str) -> str:
     return pattern.sub(lambda m: f'(symbol "{lib_name}:{m.group(1)}"', raw_text)
 
 
+def _top_level_property_blocks(raw_sym: str) -> list[tuple[str, str]]:
+    """
+    Return [(property_name, full_block_text)] for every (property "Name" ...) block
+    at depth 1 of the outer (symbol ...) definition. Sub-unit properties are skipped.
+    """
+    start = raw_sym.find("(")
+    if start == -1:
+        return []
+    # Scan children of the outer symbol node at depth 1.
+    depth = 0
+    i = 0
+    props: list[tuple[str, str]] = []
+    while i < len(raw_sym):
+        c = raw_sym[i]
+        if c == "(":
+            if depth == 1 and raw_sym.startswith('(property "', i):
+                end = _find_matching_paren(raw_sym, i)
+                name_m = re.match(r'\(property\s+"([^"]+)"', raw_sym[i:end + 1])
+                if name_m:
+                    props.append((name_m.group(1), raw_sym[i:end + 1]))
+                i = end + 1
+                continue
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        i += 1
+    return props
+
+
+def _apply_property_overrides(raw_sym: str, overrides: list[tuple[str, str]]) -> str:
+    """
+    For each (name, block) in overrides, replace a matching top-level property block
+    by name; if none exists, insert before the first sub-unit symbol (or at end).
+    """
+    out = raw_sym
+    for name, new_block in overrides:
+        pat = re.compile(
+            r'\(property\s+"' + re.escape(name) + r'"\s', re.MULTILINE
+        )
+        m = pat.search(out)
+        if m:
+            s = m.start()
+            e = _find_matching_paren(out, s)
+            if e != -1:
+                out = out[:s] + new_block + out[e + 1:]
+                continue
+        # Insert: find outer symbol's "(symbol ..." opening, place after first newline
+        # before any nested (symbol "X_0_1" sub-unit, or before closing paren.
+        subunit_m = re.search(r'\n\s*\(symbol\s+"[^"]+_\d', out)
+        insert_pos = subunit_m.start() if subunit_m else out.rfind(")")
+        out = out[:insert_pos] + "\n\t\t" + new_block + out[insert_pos:]
+    return out
+
+
+def _flatten_extends(raw_sym: str, lib_text: str, depth: int = 0) -> tuple[str, str | None]:
+    """
+    If raw_sym has (extends "parent"), inline the parent's definition, rename
+    parent + sub-units to the child's name, and overlay child's override
+    properties. Recurses for chained inheritance. Returns (flat_text, error_or_None).
+    """
+    if depth > 5:
+        return raw_sym, "extends chain too deep (>5 levels)"
+
+    ext_m = re.search(r'\(extends\s+"([^"]+)"\s*\)', raw_sym)
+    if not ext_m:
+        return raw_sym, None
+
+    parent_name = ext_m.group(1)
+    top_m = re.match(r'\s*\(symbol\s+"([^"]+)"', raw_sym)
+    if not top_m:
+        return raw_sym, "cannot find outer symbol name for extends flatten"
+    child_name = top_m.group(1)
+
+    parent_raw = _extract_raw_symbol(lib_text, parent_name)
+    if parent_raw is None:
+        return raw_sym, (
+            f"parent symbol '{parent_name}' referenced by (extends) not found in library"
+        )
+
+    # Chained: parent may itself extend something.
+    parent_raw, err = _flatten_extends(parent_raw, lib_text, depth + 1)
+    if err:
+        return raw_sym, err
+
+    # Rename parent + sub-units ("Parent", "Parent_0_1", ...) to child's name.
+    renamed = re.sub(
+        r'\(symbol\s+"' + re.escape(parent_name) + r'(_[^"]*)?"',
+        lambda mm: f'(symbol "{child_name}{mm.group(1) or ""}"',
+        parent_raw,
+    )
+
+    overrides = _top_level_property_blocks(raw_sym)
+    return _apply_property_overrides(renamed, overrides), None
+
+
 def _sch_top_uuid(sch_file: str) -> str:
     """Return the top-level (uuid "...") value from a schematic file."""
     content = Path(sch_file).read_text(encoding="utf-8")
@@ -349,21 +535,15 @@ def _ensure_lib_symbol_embedded(sch_file: str, library: str, symbol: str) -> str
     if raw_sym is None:
         return f"Symbol '{symbol}' not found in library '{library}' ({lib_file})."
 
-    # If this symbol extends a parent, embed the parent first so KiCad can
-    # resolve the inheritance chain (both must be present in lib_symbols).
-    extends_m = re.search(r'\(extends\s+"([^"]+)"', raw_sym)
-    if extends_m:
-        parent_name = extends_m.group(1)
-        err = _ensure_lib_symbol_embedded(sch_file, library, parent_name)
-        if err:
-            return err
-        # Re-read content after parent was written
-        content = path.read_text(encoding="utf-8")
-        if f'(symbol "{lib_id}"' in content:
-            return None  # child was somehow already present
+    # If this symbol extends a parent, flatten the definition by inlining the
+    # parent's graphics/pins and overlaying the child's overriding properties.
+    # lib_symbols entries are expected to be self-contained.
+    flat_sym, flat_err = _flatten_extends(raw_sym, lib_text)
+    if flat_err:
+        return flat_err
 
     # Prefix ALL symbol names (top-level and sub-units) with "library:"
-    prefixed = _prefix_symbol_names(raw_sym, symbol, library)
+    prefixed = _prefix_symbol_names(flat_sym, symbol, library)
 
     ls_start = content.find("(lib_symbols")
     if ls_start == -1:
@@ -401,6 +581,7 @@ def _symbol_instance_sexp(
     mirror_x: bool,
     sch_uuid: str,
     project_name: str,
+    footprint: str = "",
 ) -> str:
     """Generate the S-expression for a placed symbol instance."""
     mirror_line = '\n\t\t(mirror x)' if mirror_x else ''
@@ -425,7 +606,7 @@ def _symbol_instance_sexp(
         f'\t\t\t(at {x} {val_y} 0)\n'
         f'\t\t\t(effects (font (size 1.27 1.27)))\n'
         f'\t\t)\n'
-        f'\t\t(property "Footprint" ""\n'
+        f'\t\t(property "Footprint" "{footprint}"\n'
         f'\t\t\t(at {x} {y} 0)\n'
         f'\t\t\t(effects (font (size 1.27 1.27)) (hide yes))\n'
         f'\t\t)\n'
@@ -455,6 +636,7 @@ def _place_symbol(
     y: float,
     rotation: float,
     mirror_x: bool,
+    footprint: str = "",
 ) -> str | None:
     """
     Write a placed symbol instance into sch_file, embedding the lib definition
@@ -469,6 +651,7 @@ def _place_symbol(
     lib_id = f"{library}:{symbol}"
     sexp = _symbol_instance_sexp(
         lib_id, reference, value, x, y, rotation, mirror_x, sch_uuid, project_name,
+        footprint=footprint,
     )
     _append_to_sch(sch_file, sexp)
     return None

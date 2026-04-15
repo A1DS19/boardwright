@@ -17,13 +17,91 @@ def set_board_outline(
     origin_x_mm: float = 0,
     origin_y_mm: float = 0,
 ) -> dict:
+    try:
+        kicad = _kicad()
+        from kipy import board_types as bt
+        from kipy.geometry import Vector2
+        import math
+
+        board = kicad.get_board()
+        edge = bt.BoardLayer.BL_Edge_Cuts
+
+        ox, oy = origin_x_mm, origin_y_mm
+        w, h, r = width_mm, height_mm, max(0.0, corner_radius_mm)
+        r = min(r, w / 2, h / 2)
+
+        def seg(x1, y1, x2, y2):
+            s = bt.BoardSegment()
+            s.start = Vector2.from_xy_mm(x1, y1)
+            s.end = Vector2.from_xy_mm(x2, y2)
+            s.layer = edge
+            return s
+
+        def arc(cx, cy, sx, sy, ex, ey):
+            # mid at 45° between start-angle and end-angle around center
+            a1 = math.atan2(sy - cy, sx - cx)
+            a2 = math.atan2(ey - cy, ex - cx)
+            # pick shorter sweep
+            d = a2 - a1
+            while d > math.pi: d -= 2 * math.pi
+            while d < -math.pi: d += 2 * math.pi
+            am = a1 + d / 2
+            a = bt.BoardArc()
+            a.start = Vector2.from_xy_mm(sx, sy)
+            a.mid = Vector2.from_xy_mm(cx + r * math.cos(am), cy + r * math.sin(am))
+            a.end = Vector2.from_xy_mm(ex, ey)
+            a.layer = edge
+            return a
+
+        items = []
+        if r == 0:
+            items += [
+                seg(ox, oy,     ox + w, oy),
+                seg(ox + w, oy, ox + w, oy + h),
+                seg(ox + w, oy + h, ox, oy + h),
+                seg(ox, oy + h, ox, oy),
+            ]
+        else:
+            items += [
+                seg(ox + r, oy,         ox + w - r, oy),
+                seg(ox + w, oy + r,     ox + w,     oy + h - r),
+                seg(ox + w - r, oy + h, ox + r,     oy + h),
+                seg(ox, oy + h - r,     ox,         oy + r),
+                arc(ox + w - r, oy + r,       ox + w - r, oy,        ox + w, oy + r),
+                arc(ox + w - r, oy + h - r,   ox + w, oy + h - r,    ox + w - r, oy + h),
+                arc(ox + r, oy + h - r,       ox + r, oy + h,        ox, oy + h - r),
+                arc(ox + r, oy + r,           ox, oy + r,            ox + r, oy),
+            ]
+
+        board.create_items(items)
+        board.save()
+
+        _project_state["board_outline"] = {
+            "width": w, "height": h, "corner_radius": r,
+            "origin_x": ox, "origin_y": oy,
+        }
+        return {
+            "status": "ok", "source": "kipy",
+            "board_area_mm2": round(w * h, 2),
+            "segments_created": len(items),
+            "note": "Outline added to Edge.Cuts. Re-calling stacks extra shapes — delete existing outline in pcbnew first.",
+        }
+
+    except ImportError:
+        pass
+    except Exception as e:
+        if "connect" in str(e).lower() or "socket" in str(e).lower():
+            return {"status": "error",
+                    "message": "KiCad IPC unavailable. Ensure: (1) KiCad main app is open, (2) the .kicad_pcb is open in the PCB Editor window, (3) Preferences → Plugins → 'Enable KiCad API' is checked (restart KiCad if you just enabled it)."}
+        return {"status": "error", "message": f"kipy error: {e}"}
+
     _project_state["board_outline"] = {
         "width": width_mm, "height": height_mm,
         "corner_radius": corner_radius_mm,
         "origin_x": origin_x_mm, "origin_y": origin_y_mm,
     }
     return {
-        "status": "ok",
+        "status": "ok", "source": "stub",
         "board_area_mm2": round(width_mm * height_mm, 2),
         "outline": _project_state["board_outline"],
     }
@@ -109,7 +187,7 @@ def place_footprint(
         if "connect" in str(e).lower() or "socket" in str(e).lower():
             return {
                 "status": "error",
-                "message": "KiCad is not running. Open the PCB in KiCad then retry.",
+                "message": "KiCad IPC unavailable. Ensure: (1) KiCad main app is open, (2) the .kicad_pcb is open in the PCB Editor window, (3) Preferences → Plugins → 'Enable KiCad API' is checked (restart KiCad if you just enabled it).",
             }
         return {"status": "error", "message": f"kipy error: {e}"}
 
@@ -169,7 +247,7 @@ def get_ratsnest(net_filter: str | None = None) -> dict:
         if "connect" in str(e).lower() or "socket" in str(e).lower():
             return {
                 "status": "error",
-                "message": "KiCad is not running. Open the PCB in KiCad then retry.",
+                "message": "KiCad IPC unavailable. Ensure: (1) KiCad main app is open, (2) the .kicad_pcb is open in the PCB Editor window, (3) Preferences → Plugins → 'Enable KiCad API' is checked (restart KiCad if you just enabled it).",
             }
         return {"status": "error", "message": f"kipy error: {e}"}
 
@@ -244,7 +322,7 @@ def fill_zones() -> dict:
         if "connect" in str(e).lower() or "socket" in str(e).lower():
             return {
                 "status": "error",
-                "message": "KiCad is not running. Open the PCB in KiCad then retry.",
+                "message": "KiCad IPC unavailable. Ensure: (1) KiCad main app is open, (2) the .kicad_pcb is open in the PCB Editor window, (3) Preferences → Plugins → 'Enable KiCad API' is checked (restart KiCad if you just enabled it).",
             }
         return {"status": "error", "message": f"kipy error: {e}"}
 
@@ -258,6 +336,90 @@ def fill_zones() -> dict:
             "zones_filled": filled}
 
 
+def sync_pcb_from_schematic() -> dict:
+    """
+    Trigger "Update PCB from Schematic" in the open PCB Editor via kipy.run_action.
+    Equivalent to pressing F8 in pcbnew. Requires the PCB Editor window to be open.
+    Uses kipy's unstable run_action API — action name may change across KiCad versions.
+    """
+    try:
+        kicad = _kicad()
+        result = kicad.run_action("pcbnew.EditorControl.updatePcbFromSchematic")
+        return {"status": "ok", "source": "kipy", "run_action_result": str(result),
+                "note": "KiCad may show a confirmation dialog that requires manual acknowledgement."}
+    except ImportError:
+        return {"status": "error", "message": "kipy not installed."}
+    except Exception as e:
+        if "connect" in str(e).lower() or "socket" in str(e).lower():
+            return {"status": "error",
+                    "message": "KiCad IPC unavailable. Ensure: (1) KiCad main app is open, (2) the .kicad_pcb is open in the PCB Editor window, (3) Preferences → Plugins → 'Enable KiCad API' is checked (restart KiCad if you just enabled it)."}
+        return {"status": "error",
+                "message": f"run_action failed: {e}. Fallback: press F8 in pcbnew manually."}
+
+
+def save_board() -> dict:
+    """Save the currently open PCB via kipy IPC."""
+    try:
+        kicad = _kicad()
+        board = kicad.get_board()
+        board.save()
+        return {"status": "ok", "source": "kipy"}
+    except ImportError:
+        return {"status": "error", "message": "kipy not installed — cannot save board."}
+    except Exception as e:
+        if "connect" in str(e).lower() or "socket" in str(e).lower():
+            return {"status": "error",
+                    "message": "KiCad IPC unavailable. Ensure: (1) KiCad main app is open, (2) the .kicad_pcb is open in the PCB Editor window, (3) Preferences → Plugins → 'Enable KiCad API' is checked (restart KiCad if you just enabled it)."}
+        return {"status": "error", "message": f"kipy error: {e}"}
+
+
+def get_pad_positions(reference: str) -> dict:
+    """Return absolute pad positions for a placed footprint on the PCB."""
+    try:
+        kicad = _kicad()
+        import math
+        board = kicad.get_board()
+        fp = next((f for f in board.get_footprints()
+                   if f.reference_field.text.value == reference), None)
+        if fp is None:
+            return {"status": "error", "message": f"Footprint '{reference}' not found on board."}
+
+        theta = fp.orientation.degrees * math.pi / 180.0
+        cos_t, sin_t = math.cos(theta), math.sin(theta)
+        fp_x, fp_y = fp.position.x, fp.position.y
+
+        pads = []
+        for pad in fp.pads:
+            lx, ly = pad.position.x, pad.position.y
+            ax = fp_x + (lx * cos_t - ly * sin_t)
+            ay = fp_y + (lx * sin_t + ly * cos_t)
+            pads.append({
+                "number": pad.number,
+                "net": pad.net.name if pad.net else "",
+                "x_mm": round(ax / 1_000_000, 4),
+                "y_mm": round(ay / 1_000_000, 4),
+            })
+
+        return {
+            "status": "ok", "source": "kipy",
+            "reference": reference,
+            "footprint_position_mm": {
+                "x": round(fp_x / 1_000_000, 4),
+                "y": round(fp_y / 1_000_000, 4),
+                "rotation_deg": fp.orientation.degrees,
+            },
+            "pads": pads,
+        }
+
+    except ImportError:
+        return {"status": "error", "message": "kipy not installed."}
+    except Exception as e:
+        if "connect" in str(e).lower() or "socket" in str(e).lower():
+            return {"status": "error",
+                    "message": "KiCad IPC unavailable. Ensure: (1) KiCad main app is open, (2) the .kicad_pcb is open in the PCB Editor window, (3) Preferences → Plugins → 'Enable KiCad API' is checked (restart KiCad if you just enabled it)."}
+        return {"status": "error", "message": f"kipy error: {e}"}
+
+
 HANDLERS = {
     "set_board_outline":  set_board_outline,
     "add_mounting_holes": add_mounting_holes,
@@ -266,6 +428,9 @@ HANDLERS = {
     "add_keepout_zone":   add_keepout_zone,
     "add_zone":           add_zone,
     "fill_zones":         fill_zones,
+    "save_board":         save_board,
+    "get_pad_positions":  get_pad_positions,
+    "sync_pcb_from_schematic": sync_pcb_from_schematic,
 }
 
 
@@ -386,5 +551,26 @@ TOOL_SCHEMAS = [
         "name": "fill_zones",
         "description": "Execute copper pour fill on all defined zones.",
         "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "save_board",
+        "description": "Save the currently open PCB to disk via KiCad IPC. Use after placements/routes to persist changes.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "sync_pcb_from_schematic",
+        "description": "Push schematic netlist to the open PCB (equivalent to pressing F8 in pcbnew). Uses kipy run_action — KiCad may show a dialog. Call before place_footprint when footprints/nets are missing.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "get_pad_positions",
+        "description": "Return absolute pad positions (x_mm, y_mm) and connected net for every pad of a footprint on the PCB. Accounts for footprint rotation. Use before route_trace to get real coordinates.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reference": {"type": "string", "description": "e.g. R1, U3, BT1"}
+            },
+            "required": ["reference"]
+        }
     },
 ]

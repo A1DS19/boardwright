@@ -72,6 +72,7 @@ TOOL_CATEGORIES: list[dict[str, Any]] = [
             "move_symbol",
             "move_label",
             "assign_footprint",
+            "remove_symbol",
         ],
     },
     {
@@ -83,12 +84,15 @@ TOOL_CATEGORIES: list[dict[str, Any]] = [
             "add_keepout_zone",
             "add_zone",
             "fill_zones",
+            "save_board",
+            "get_pad_positions",
+            "sync_pcb_from_schematic",
         ],
     },
     {
         "name": "routing_advanced",
         "description": "Differential pair routing and vias.",
-        "tools": ["route_differential_pair", "add_via"],
+        "tools": ["route_differential_pair", "add_via", "autoroute_pcb"],
     },
     {
         "name": "pcb_checks",
@@ -243,8 +247,9 @@ def execute_tool(tool_name: str, params: dict | None = None) -> dict:
         fn = dispatcher.ALL_HANDLERS.get(tool_name)
         if fn is None:
             return {"status": "error", "message": f"Unknown tool: {tool_name}"}
+        coerced = dispatcher._coerce_input(params or {}, dispatcher.ALL_SCHEMAS.get(tool_name))
         try:
-            result = fn(**(params or {}))
+            result = fn(**coerced)
             if isinstance(result, dict):
                 result.setdefault("note", f"'{tool_name}' is a direct tool; you can call it by name without execute_tool.")
             return result
@@ -259,8 +264,9 @@ def execute_tool(tool_name: str, params: dict | None = None) -> dict:
             "hint": "Use list_tool_categories or search_tools to discover available tools.",
         }
 
+    coerced = dispatcher._coerce_input(params or {}, dispatcher.ALL_SCHEMAS.get(tool_name))
     try:
-        return fn(**(params or {}))
+        return fn(**coerced)
     except TypeError as e:
         return {"status": "error", "message": f"Invalid arguments for {tool_name}: {e}"}
     except Exception as e:  # noqa: BLE001

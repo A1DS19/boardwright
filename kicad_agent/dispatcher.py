@@ -87,6 +87,56 @@ TOOLS: list[dict[str, Any]] = (
 # Public dispatch
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _coerce_scalar(value: Any, json_type: str) -> Any:
+    """Coerce a stringified scalar to the JSON type declared by the schema.
+
+    Silently returns the original value on mismatch so malformed input still
+    reaches the handler and produces a normal TypeError.
+    """
+    if not isinstance(value, str):
+        return value
+    if json_type == "boolean":
+        low = value.strip().lower()
+        if low in ("true", "1", "yes"):
+            return True
+        if low in ("false", "0", "no"):
+            return False
+        return value
+    if json_type == "integer":
+        try:
+            return int(value)
+        except ValueError:
+            return value
+    if json_type == "number":
+        try:
+            return float(value)
+        except ValueError:
+            return value
+    return value
+
+
+def _coerce_input(tool_input: dict, schema: dict | None) -> dict:
+    """Walk ``tool_input`` against an input_schema and coerce stringified scalars.
+
+    Fields absent from the schema, or with composite/union types, pass through
+    untouched. Only ``integer``/``number``/``boolean`` are coerced.
+    """
+    if not schema or not isinstance(tool_input, dict):
+        return tool_input
+    props = (schema.get("input_schema") or {}).get("properties") or {}
+    if not props:
+        return tool_input
+    out = dict(tool_input)
+    for key, val in tool_input.items():
+        spec = props.get(key)
+        if not isinstance(spec, dict):
+            continue
+        t = spec.get("type")
+        if isinstance(t, str) and t in ("integer", "number", "boolean"):
+            out[key] = _coerce_scalar(val, t)
+    return out
+
+
 def dispatch_tool(tool_name: str, tool_input: dict) -> dict:
     """
     Route a tool call from the agent to the correct implementation function.
@@ -106,8 +156,9 @@ def dispatch_tool(tool_name: str, tool_input: dict) -> dict:
             "status": "error",
             "message": f"Unknown tool '{tool_name}'. Check TOOLS list.",
         }
+    coerced = _coerce_input(tool_input or {}, ALL_SCHEMAS.get(tool_name))
     try:
-        return fn(**(tool_input or {}))
+        return fn(**coerced)
     except TypeError as exc:
         return {
             "status": "error",
