@@ -84,6 +84,8 @@ TOOL_CATEGORIES: list[dict[str, Any]] = [
             "add_keepout_zone",
             "add_zone",
             "fill_zones",
+            "strip_edge_cuts",
+            "strip_zones",
             "save_board",
             "get_pad_positions",
             "sync_pcb_from_schematic",
@@ -92,7 +94,7 @@ TOOL_CATEGORIES: list[dict[str, Any]] = [
     {
         "name": "routing_advanced",
         "description": "Differential pair routing and vias.",
-        "tools": ["route_differential_pair", "add_via", "autoroute_pcb"],
+        "tools": ["route_path", "route_differential_pair", "add_via", "autoroute_pcb"],
     },
     {
         "name": "pcb_checks",

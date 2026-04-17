@@ -90,10 +90,30 @@ def set_board_outline(
     except ImportError:
         pass
     except Exception as e:
-        if "connect" in str(e).lower() or "socket" in str(e).lower():
-            return {"status": "error",
-                    "message": "KiCad IPC unavailable. Ensure: (1) KiCad main app is open, (2) the .kicad_pcb is open in the PCB Editor window, (3) Preferences → Plugins → 'Enable KiCad API' is checked (restart KiCad if you just enabled it)."}
-        return {"status": "error", "message": f"kipy error: {e}"}
+        # Fall through to file-write fallback on any kipy error — pcbnew may be
+        # closed, or the API version mismatch ("no handler available"), or the
+        # PCB Editor window isn't open.
+        pass
+
+    # File-write fallback — pcbnew must be closed on this file.
+    pcb = _pcb_file()
+    if pcb:
+        from . import _pcb_writer as pw
+        n = pw.append_rounded_rect_outline(
+            pcb, width_mm, height_mm, corner_radius_mm,
+            origin_x_mm, origin_y_mm,
+        )
+        _project_state["board_outline"] = {
+            "width": width_mm, "height": height_mm,
+            "corner_radius": corner_radius_mm,
+            "origin_x": origin_x_mm, "origin_y": origin_y_mm,
+        }
+        return {
+            "status": "ok", "source": "file",
+            "board_area_mm2": round(width_mm * height_mm, 2),
+            "segments_created": n,
+            "note": "Wrote Edge.Cuts directly to .kicad_pcb. Ensure pcbnew is closed — otherwise it will overwrite on next save. Re-call to stack extra shapes; use strip_edge_cuts first to reset.",
+        }
 
     _project_state["board_outline"] = {
         "width": width_mm, "height": height_mm,
@@ -183,25 +203,36 @@ def place_footprint(
 
     except ImportError:
         pass
-    except Exception as e:
-        if "connect" in str(e).lower() or "socket" in str(e).lower():
-            return {
-                "status": "error",
-                "message": "KiCad IPC unavailable. Ensure: (1) KiCad main app is open, (2) the .kicad_pcb is open in the PCB Editor window, (3) Preferences → Plugins → 'Enable KiCad API' is checked (restart KiCad if you just enabled it).",
-            }
-        return {"status": "error", "message": f"kipy error: {e}"}
+    except Exception:
+        # Fall through on any kipy error to the file-write fallback.
+        pass
 
-    # Stub fallback
+    # File-write fallback — pcbnew must be closed on this file.
+    pcb = _pcb_file()
+    if pcb:
+        from . import _pcb_writer as pw
+        hit = pw.move_footprint(pcb, reference, x_mm, y_mm, rotation_deg)
+        if not hit:
+            return {"status": "error",
+                    "message": f"Footprint '{reference}' not found in .kicad_pcb. Sync from schematic first (F8 in pcbnew)."}
+        _project_state["placements"][reference] = {
+            "x": x_mm, "y": y_mm, "rotation": rotation_deg, "layer": layer,
+        }
+        return {
+            "status": "ok", "source": "file",
+            "reference": reference,
+            "x_mm": x_mm, "y_mm": y_mm, "rotation_deg": rotation_deg,
+            "layer": layer,
+            "note": "Wrote placement directly to .kicad_pcb. Ensure pcbnew is closed on this file.",
+        }
+
     _project_state["placements"][reference] = {
         "x": x_mm, "y": y_mm, "rotation": rotation_deg, "layer": layer,
     }
     return {
-        "status": "ok",
-        "source": "stub",
-        "note": "KiCad not running — open PCB in KiCad for live placement",
-        "reference": reference,
-        "x_mm": x_mm,
-        "y_mm": y_mm,
+        "status": "ok", "source": "stub",
+        "note": "No pcb_file set — call set_project first.",
+        "reference": reference, "x_mm": x_mm, "y_mm": y_mm,
     }
 
 
@@ -291,18 +322,32 @@ def add_zone(
     fill_mode: str = "solid",
     priority: int = 0,
 ) -> dict:
+    """Add a copper pour zone. Writes directly to .kicad_pcb (pcbnew must be closed)."""
+    pcb = _pcb_file()
+    if pcb:
+        from . import _pcb_writer as pw
+        pts = [(float(p[0]), float(p[1])) for p in outline_mm]
+        r = pw.append_zone(pcb, net_name, layer, pts,
+                           clearance_mm=clearance_mm, min_width_mm=min_width_mm)
+        if r.get("status") == "ok":
+            r["source"] = "file"
+            r["note"] = "Wrote zone to .kicad_pcb. Open in pcbnew and press B to fill."
+            _project_state["zones"].append({
+                "type": "copper", "net_name": net_name, "layer": layer,
+                "outline_mm": outline_mm, "clearance_mm": clearance_mm,
+                "min_width_mm": min_width_mm, "fill_mode": fill_mode,
+                "priority": priority, "filled": False,
+            })
+            return r
+        return r
+
     _project_state["zones"].append({
-        "type": "copper",
-        "net_name": net_name,
-        "layer": layer,
-        "outline_mm": outline_mm,
-        "clearance_mm": clearance_mm,
-        "min_width_mm": min_width_mm,
-        "fill_mode": fill_mode,
-        "priority": priority,
-        "filled": False,
+        "type": "copper", "net_name": net_name, "layer": layer,
+        "outline_mm": outline_mm, "clearance_mm": clearance_mm,
+        "min_width_mm": min_width_mm, "fill_mode": fill_mode,
+        "priority": priority, "filled": False,
     })
-    return {"status": "ok", "net_name": net_name, "layer": layer}
+    return {"status": "ok", "source": "stub", "net_name": net_name, "layer": layer}
 
 
 def fill_zones() -> dict:
@@ -412,12 +457,48 @@ def get_pad_positions(reference: str) -> dict:
         }
 
     except ImportError:
-        return {"status": "error", "message": "kipy not installed."}
+        pass
     except Exception as e:
-        if "connect" in str(e).lower() or "socket" in str(e).lower():
-            return {"status": "error",
-                    "message": "KiCad IPC unavailable. Ensure: (1) KiCad main app is open, (2) the .kicad_pcb is open in the PCB Editor window, (3) Preferences → Plugins → 'Enable KiCad API' is checked (restart KiCad if you just enabled it)."}
-        return {"status": "error", "message": f"kipy error: {e}"}
+        if "connect" not in str(e).lower() and "socket" not in str(e).lower():
+            return {"status": "error", "message": f"kipy error: {e}"}
+
+    # File-read fallback
+    pcb = _pcb_file()
+    if not pcb:
+        return {"status": "error", "message": "No pcb_file set. Call set_project first."}
+    from . import _pcb_writer as pw
+    place = pw.read_footprint_placement(pcb, reference)
+    if place is None:
+        return {"status": "error", "message": f"Footprint '{reference}' not found in .kicad_pcb."}
+    pads = pw.read_pad_positions(pcb, reference)
+    return {
+        "status": "ok", "source": "file",
+        "reference": reference,
+        "footprint_position_mm": {
+            "x": place["x"], "y": place["y"], "rotation_deg": place["rotation"],
+        },
+        "pads": pads,
+    }
+
+
+def strip_edge_cuts() -> dict:
+    """Remove all Edge.Cuts outlines from the PCB (file write). Returns count removed."""
+    pcb = _pcb_file()
+    if not pcb:
+        return {"status": "error", "message": "No pcb_file set."}
+    from . import _pcb_writer as pw
+    n = pw.strip_edge_cuts(pcb)
+    return {"status": "ok", "removed": n}
+
+
+def strip_zones() -> dict:
+    """Remove all copper pour zones from the PCB (file write). Returns count removed."""
+    pcb = _pcb_file()
+    if not pcb:
+        return {"status": "error", "message": "No pcb_file set."}
+    from . import _pcb_writer as pw
+    n = pw.strip_zones(pcb)
+    return {"status": "ok", "removed": n}
 
 
 HANDLERS = {
@@ -428,6 +509,8 @@ HANDLERS = {
     "add_keepout_zone":   add_keepout_zone,
     "add_zone":           add_zone,
     "fill_zones":         fill_zones,
+    "strip_edge_cuts":    strip_edge_cuts,
+    "strip_zones":        strip_zones,
     "save_board":         save_board,
     "get_pad_positions":  get_pad_positions,
     "sync_pcb_from_schematic": sync_pcb_from_schematic,
@@ -550,6 +633,16 @@ TOOL_SCHEMAS = [
     {
         "name": "fill_zones",
         "description": "Execute copper pour fill on all defined zones.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "strip_edge_cuts",
+        "description": "Remove all existing Edge.Cuts segments/arcs from the PCB file. Call before re-issuing set_board_outline to avoid stacked outlines.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "strip_zones",
+        "description": "Remove all copper pour zones from the PCB file. Call before re-issuing add_zone to reset.",
         "input_schema": {"type": "object", "properties": {}}
     },
     {

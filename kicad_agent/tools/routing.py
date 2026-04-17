@@ -90,11 +90,50 @@ def route_trace(
         pass
     except ValueError as e:
         return {"status": "error", "message": str(e)}
-    except Exception as e:
-        if "connect" in str(e).lower() or "socket" in str(e).lower():
+    except Exception:
+        # Fall through to file-write fallback on any kipy error.
+        pass
+
+    # File-write fallback — pcbnew must be closed. Accepts 'REF:PIN' or 'x,y'.
+    pcb = _pcb_file()
+    if pcb:
+        from . import _pcb_writer as pw
+        try:
+            x1, y1 = pw.resolve_pad_coord(pcb, from_pad)
+            x2, y2 = pw.resolve_pad_coord(pcb, to_pad)
+        except ValueError as e:
+            return {"status": "error", "message": str(e)}
+
+        nets = pw.read_nets(pcb)
+        nc = nets.get(net_name) or nets.get("/" + net_name.lstrip("/"))
+        if nc is None:
             return {"status": "error",
-                    "message": "KiCad IPC unavailable. Ensure: (1) KiCad main app is open, (2) the .kicad_pcb is open in the PCB Editor window, (3) Preferences → Plugins → 'Enable KiCad API' is checked (restart KiCad if you just enabled it)."}
-        return {"status": "error", "message": f"kipy error: {e}"}
+                    "message": f"Net '{net_name}' not found in PCB. Known: {sorted(nets.keys())[:10]}"}
+
+        if via_at and len(via_at) == 2:
+            mx, my = float(via_at[0]), float(via_at[1])
+            other_layer = "B.Cu" if layer == "F.Cu" else "F.Cu"
+            pw.append_segments(pcb, [
+                {"start": (x1, y1), "end": (mx, my),
+                 "width_mm": width_mm, "layer": layer, "net_code": nc},
+                {"start": (mx, my), "end": (x2, y2),
+                 "width_mm": width_mm, "layer": other_layer, "net_code": nc},
+            ])
+            pw.append_via(pcb, mx, my, nc)
+            seg_count = 3
+        else:
+            seg_count = pw.append_segments(pcb, [{
+                "start": (x1, y1), "end": (x2, y2),
+                "width_mm": width_mm, "layer": layer, "net_code": nc,
+            }])
+
+        _project_state["traces"].append({
+            "net_name": net_name, "from_pad": from_pad, "to_pad": to_pad,
+            "width_mm": width_mm, "layer": layer, "via_at": via_at,
+        })
+        return {"status": "ok", "source": "file", "net_name": net_name,
+                "from": from_pad, "to": to_pad, "segments": seg_count,
+                "note": "Wrote segment(s) directly to .kicad_pcb. Ensure pcbnew is closed."}
 
     trace = {
         "net_name": net_name, "from_pad": from_pad,
@@ -104,6 +143,55 @@ def route_trace(
     _project_state["traces"].append(trace)
     return {"status": "ok", "source": "stub", "net_name": net_name,
             "from": from_pad, "to": to_pad}
+
+
+def route_path(
+    net_name: str,
+    waypoints: list,
+    width_mm: float,
+    layer: str = "F.Cu",
+) -> dict:
+    """
+    Route a trace through a sequence of waypoints (≥2). Each entry may be
+    'REF:PIN' or 'x,y' (mm). Writes one (segment ...) per consecutive pair
+    via the file-write backend, so pcbnew must be closed.
+    """
+    if not waypoints or len(waypoints) < 2:
+        return {"status": "error",
+                "message": "route_path needs at least 2 waypoints."}
+
+    pcb = _pcb_file()
+    if not pcb:
+        return {"status": "error",
+                "message": "No pcb_file set. Call set_project first."}
+
+    from . import _pcb_writer as pw
+    try:
+        coords = [pw.resolve_pad_coord(pcb, str(wp)) for wp in waypoints]
+    except ValueError as e:
+        return {"status": "error", "message": str(e)}
+
+    nets = pw.read_nets(pcb)
+    nc = nets.get(net_name) or nets.get("/" + net_name.lstrip("/"))
+    if nc is None:
+        return {"status": "error",
+                "message": f"Net '{net_name}' not found. Known: {sorted(nets.keys())[:10]}"}
+
+    segs = []
+    for i in range(len(coords) - 1):
+        a, b = coords[i], coords[i + 1]
+        if a == b:
+            continue
+        segs.append({"start": a, "end": b, "width_mm": width_mm,
+                     "layer": layer, "net_code": nc})
+    n = pw.append_segments(pcb, segs)
+    _project_state["traces"].append({
+        "net_name": net_name, "waypoints": list(waypoints),
+        "width_mm": width_mm, "layer": layer,
+    })
+    return {"status": "ok", "source": "file", "net_name": net_name,
+            "segments": n, "waypoints": len(coords),
+            "note": "Wrote segments directly to .kicad_pcb. Ensure pcbnew is closed."}
 
 
 def route_differential_pair(
@@ -161,10 +249,25 @@ def add_via(
     except ValueError as e:
         return {"status": "error", "message": str(e)}
     except Exception as e:
-        if "connect" in str(e).lower() or "socket" in str(e).lower():
-            return {"status": "error",
-                    "message": "KiCad IPC unavailable. Ensure: (1) KiCad main app is open, (2) the .kicad_pcb is open in the PCB Editor window, (3) Preferences → Plugins → 'Enable KiCad API' is checked (restart KiCad if you just enabled it)."}
-        return {"status": "error", "message": f"kipy error: {e}"}
+        if "connect" not in str(e).lower() and "socket" not in str(e).lower():
+            return {"status": "error", "message": f"kipy error: {e}"}
+
+    # File-write fallback
+    pcb = _pcb_file()
+    if pcb:
+        from . import _pcb_writer as pw
+        nets = pw.read_nets(pcb)
+        net_code = nets.get(net_name)
+        if net_code is None:
+            return {"status": "error", "message": f"Net '{net_name}' not found in PCB"}
+        pw.append_via(pcb, x_mm, y_mm, net_code, pad_mm=pad_mm, drill_mm=drill_mm)
+        _project_state["vias"].append({
+            "net_name": net_name, "x": x_mm, "y": y_mm,
+            "drill_mm": drill_mm, "pad_mm": pad_mm,
+            "from_layer": from_layer, "to_layer": to_layer,
+        })
+        return {"status": "ok", "source": "file", "net_name": net_name, "x": x_mm, "y": y_mm,
+                "note": "Wrote via directly to .kicad_pcb. Ensure pcbnew is closed."}
 
     _project_state["vias"].append({
         "net_name": net_name, "x": x_mm, "y": y_mm,
@@ -300,6 +403,7 @@ def autoroute_pcb(
 
 HANDLERS = {
     "route_trace":             route_trace,
+    "route_path":              route_path,
     "route_differential_pair": route_differential_pair,
     "add_via":                 add_via,
     "autoroute_pcb":           autoroute_pcb,
@@ -328,6 +432,24 @@ TOOL_SCHEMAS = [
                 }
             },
             "required": ["net_name", "from_pad", "to_pad", "width_mm", "layer"]
+        }
+    },
+    {
+        "name": "route_path",
+        "description": "Route a trace through a sequence of waypoints in one call. Each waypoint is 'REF:PIN' or 'x,y' in mm. Emits one segment per consecutive pair. Use instead of multiple route_trace calls for L-shaped or multi-hop routes.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "net_name":  {"type": "string"},
+                "waypoints": {
+                    "type": "array",
+                    "description": "Ordered list of 'REF:PIN' strings or 'x,y' strings (mm).",
+                    "items": {"type": "string"},
+                },
+                "width_mm":  {"type": "number"},
+                "layer":     {"type": "string", "enum": ["F.Cu", "B.Cu", "In1.Cu", "In2.Cu"], "default": "F.Cu"}
+            },
+            "required": ["net_name", "waypoints", "width_mm"]
         }
     },
     {
