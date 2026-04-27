@@ -19,6 +19,8 @@ from ..state import _kicad_lib_search_paths, _project_state
 load_dotenv()
 
 _MOUSER_SEARCH_URL = "https://api.mouser.com/api/v1/search/keyword"
+_JLCSEARCH_URL = "https://jlcsearch.tscircuit.com/api/search"
+_JLCSEARCH_USER_AGENT = "boardwright/0.3.0 (+https://github.com/A1DS19/boardwright)"
 _DATASHEET_FOLDER = "mcp_kicad_datasheets"
 _REQUEST_TIMEOUT = 10  # seconds for external HTTP requests
 
@@ -158,6 +160,78 @@ def search_components(
         })
 
     return {"status": "ok", "results": results}
+
+
+def search_components_lcsc(
+    query: str,
+    package: str | None = None,
+    max_results: int = 20,
+    basic_only: bool = True,
+) -> dict:
+    """Search LCSC / JLCPCB for parts via the tscircuit.com public proxy.
+
+    Indie-maker workflow: "is this part on JLCPCB and is it a Basic part
+    (cheap assembly) or Extended (loading fee)?" `basic_only=True` filters
+    to JLCPCB Basic parts — the cheapest assembly tier.
+
+    Returns LCSC part numbers ready for use in BOMs and pick-and-place files
+    submitted to JLCPCB Assembly. Zero-auth — no API key needed.
+    """
+    params: dict[str, str] = {"q": query, "limit": str(max_results)}
+    if package:
+        params["package"] = package
+    if basic_only:
+        params["is_basic"] = "true"
+
+    try:
+        resp = requests.get(
+            _JLCSEARCH_URL,
+            params=params,
+            headers={"User-Agent": _JLCSEARCH_USER_AGENT},
+            timeout=_REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        return {"status": "error", "message": f"JLCSearch request failed: {exc}"}
+
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        return {"status": "error", "message": f"JLCSearch returned non-JSON: {exc}"}
+
+    components = data.get("components") or []
+
+    results = []
+    for c in components:
+        lcsc = c.get("lcsc") or ""
+        results.append({
+            "lcsc": str(lcsc) if lcsc else None,
+            "mpn": c.get("mfr") or None,
+            "package": c.get("package") or None,
+            "description": c.get("description") or "",
+            "stock_jlcpcb": c.get("stock"),
+            "price_usd": c.get("price"),
+            "is_basic": bool(c.get("is_basic")),
+            "is_preferred": bool(c.get("is_preferred")),
+            "datasheet_url": c.get("datasheet") or None,
+            "product_url": (
+                f"https://www.lcsc.com/product-detail/{lcsc}.html" if lcsc else None
+            ),
+        })
+
+    return {
+        "status": "ok",
+        "source": "jlcsearch.tscircuit.com",
+        "query": query,
+        "package": package,
+        "basic_only": basic_only,
+        "result_count": len(results),
+        "results": results,
+        "note": (
+            "Basic parts are pre-loaded on JLCPCB assembly machines (no setup fee). "
+            "Extended parts cost ~$3 per unique component to load. Prefer Basic when available."
+        ),
+    }
 
 
 def _find_datasheet_url(mpn: str) -> tuple[str | None, str | None]:
@@ -576,6 +650,7 @@ def impedance_calc(
 
 HANDLERS = {
     "search_components":         search_components,
+    "search_components_lcsc":    search_components_lcsc,
     "get_datasheet":             get_datasheet,
     "verify_kicad_footprint":    verify_kicad_footprint,
     "generate_custom_footprint": generate_custom_footprint,
@@ -587,9 +662,11 @@ TOOL_SCHEMAS = [
     {
         "name": "search_components",
         "description": (
-            "Search Octopart and Mouser for real, in-stock components matching a "
-            "functional description. Returns MPN, manufacturer, package, price, "
-            "availability, and KiCad footprint hint. Use to build the BOM."
+            "Search Mouser for real, in-stock components matching a functional "
+            "description. Returns MPN, manufacturer, package, price, availability, "
+            "and product URL. Requires MOUSER_API_KEY in .env. For JLCPCB-bound "
+            "designs, prefer search_components_lcsc — it returns LCSC part numbers "
+            "and Basic/Extended flags directly."
         ),
         "input_schema": {
             "type": "object",
@@ -608,6 +685,45 @@ TOOL_SCHEMAS = [
                     "type": "array",
                     "items": {"type": "string"},
                     "default": ["Mouser", "Digi-Key"]
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "search_components_lcsc",
+        "description": (
+            "Search LCSC / JLCPCB for parts via the public jlcsearch.tscircuit.com "
+            "proxy (zero-auth, no API key needed). Returns LCSC part number, MPN, "
+            "package, JLCPCB stock, price, and the Basic/Extended flag — the single "
+            "most important field for indie makers using JLCPCB Assembly. "
+            "Basic parts are pre-loaded on JLC's assembly machines (no setup fee); "
+            "Extended parts cost ~$3 each to load. Use this whenever the user is "
+            "building a board they intend to fab and assemble at JLCPCB."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Functional description or MPN, e.g. '3.3V LDO 500mA SOT-23' or 'AMS1117-3.3'"
+                },
+                "package": {
+                    "type": "string",
+                    "description": "Optional package filter, e.g. 'SOT-23', '0402', 'QFN-32'"
+                },
+                "max_results": {
+                    "type": "integer",
+                    "default": 20,
+                    "description": "Up to 20 typically; JLC search is fast"
+                },
+                "basic_only": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": (
+                        "When true (default), only return JLCPCB Basic parts (cheapest assembly). "
+                        "Set false to include Extended parts (~$3/unique-component setup fee)."
+                    )
                 }
             },
             "required": ["query"]

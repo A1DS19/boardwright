@@ -214,8 +214,8 @@ This is what gets shipped publicly. Phase 1 *is* the validation gate's product.
 This is the tool as of 2026-04-27. Everything below is shipped and working.
 
 **Python MCP server, ~5,900 LOC.**
-- `boardwright/dispatcher.py` — central tool registry; merges 41 schemas across 8 domain modules; handles scalar coercion for harnesses that serialize numbers as strings.
-- `boardwright/router.py` — tool taxonomy. 16 "direct" tools visible in `list_tools()` for the common path; 25 "routed" tools hidden behind 5 meta-tools (`project_admin`, `research`, `schematic_advanced`, `pcb_layout_advanced`, `routing_advanced`) to keep Claude's tool-list context clean. Both surfaces reachable via `execute_tool`.
+- `boardwright/dispatcher.py` — central tool registry; merges 44 schemas across 8 domain modules; handles scalar coercion for harnesses that serialize numbers as strings.
+- `boardwright/router.py` — tool taxonomy. 16 "direct" tools visible in `list_tools()` for the common path; 28 "routed" tools hidden behind 7 meta-tools to keep Claude's tool-list context clean. Both surfaces reachable via `execute_tool`.
 - `boardwright/backends.py` — hybrid runtime. `kipy` IPC for live PCB ops, `kicad-cli` subprocess for ERC/DRC and fab outputs, direct S-expression file editing for schematics, stub fallbacks for testing without KiCad.
 - `boardwright/state.py` — single shared project state dict.
 - `boardwright/schematic_io.py` — S-expression parser/serializer for `.kicad_sch`.
@@ -292,7 +292,7 @@ This is the only ordered list in this document. Each item ships before the next 
 3. **GitHub Actions CI.** pytest on 3.10/3.11/3.12, ruff lint, typecheck. ✓
 4. **README rewrite.** Lead with positioning, install via pip, KiCad prereqs, 60-second demo, then tool reference. Move Fedora/Java footnote to `docs/troubleshooting.md`. ✓
 5. **Landing page at `web/`.** TanStack Start + Tailwind 4 + Cloudflare Workers, mirroring klickbrain's stack with PCB-trace green replacing honey-amber. Hero, Benefits, How-It-Works, Final-CTA. Buttondown waitlist. ✓
-6. **DFM profiles for JLCPCB / PCBWay / OSH Park** — added to `boardwright/tools/pcb_checks.py` as `dfm_check_jlcpcb`, `dfm_check_pcbway`, `dfm_check_oshpark`. Hand-tuned DRC presets per fab house, in the free tier. Closes the gap with `kicad-mcp-pro` on the table-stakes axis.
+6. **DFM profiles for JLCPCB / PCBWay / OSH Park** — shipped 2026-04-27. Three new tools (`dfm_apply_jlcpcb`, `dfm_apply_pcbway`, `dfm_apply_oshpark`) write the fab's design rules into `.kicad_pro`. `run_drc(rules_preset=...)` now applies the preset before running DRC. Six bundled profiles (standard + advanced for JLC/PCBWay; 2-layer + 4-layer for OSH Park). 18 new tests; 114 total passing. ✓
 7. **README "Compared to" section.** A short, fair-minded comparison against the four direct OSS competitors (`kicad-mcp-pro`, `Seeed-Studio/kicad-mcp-server`, `kicad-claude-toolkit`, `bunnyf/pcb-mcp`). Acknowledging the field defuses HN comments before they happen.
 8. **PyPI release.** `pip install boardwright`. Pin a 0.3.0 version.
 9. **Branding assets.** Replace `web/public/favicon.ico` and `web/public/og-image.png` with Boardwright artwork. Logo mark in PCB-trace green. OG image at 1200×630.

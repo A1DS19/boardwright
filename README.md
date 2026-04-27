@@ -1,6 +1,6 @@
 # Boardwright
 
-**AI-native KiCad.** An MCP server that gives Claude 41 KiCad design tools across the full PCB workflow — research, schematic, layout, copper pours, routing, validation, and fab outputs. Describe a board in plain English; Claude drives your local KiCad install to design it.
+**AI-native KiCad.** An MCP server that gives Claude 44 KiCad design tools across the full PCB workflow — research, schematic, layout, copper pours, routing, validation, and fab outputs. Describe a board in plain English; Claude drives your local KiCad install to design it.
 
 - **Local-first.** Your KiCad, your libraries, your fab presets. Files never leave your machine.
 - **Open core.** MIT-licensed. No telemetry. BYO LLM.
@@ -76,7 +76,7 @@ For autorouting via Freerouting, see [docs/troubleshooting.md](docs/troubleshoot
 
 | Phase | Tools |
 |-------|-------|
-| Project | `set_project`, `get_capabilities`, `set_drc_severity`, `add_drc_exclusion` |
+| Project | `set_project`, `get_capabilities`, `set_drc_severity`, `add_drc_exclusion`, `dfm_apply_jlcpcb`, `dfm_apply_pcbway`, `dfm_apply_oshpark` |
 | Research | `search_components`, `get_datasheet`, `verify_kicad_footprint`, `generate_custom_footprint`, `impedance_calc` |
 | Schematic | `create_schematic_sheet`, `add_symbol`, `add_power_symbol`, `connect_pins`, `add_net_label`, `add_no_connect`, `remove_no_connect`, `get_pin_positions`, `move_symbol`, `move_label`, `assign_footprint`, `run_erc` |
 | PCB Layout | `set_board_outline`, `add_mounting_holes`, `place_footprint`, `get_ratsnest`, `add_keepout_zone`, `auto_arrange`, `fit_board_outline` |
@@ -86,7 +86,7 @@ For autorouting via Freerouting, see [docs/troubleshooting.md](docs/troubleshoot
 | Fab Outputs | `generate_gerbers`, `generate_drill_files`, `generate_bom`, `generate_position_file`, `generate_3d_model` |
 | Filesystem | `list_directory`, `read_file` |
 
-To keep Claude's tool-list context clean, 16 commonly-used tools are exposed directly and 25 advanced tools are routed through 5 meta-tools (`project_admin`, `research`, `schematic_advanced`, `pcb_layout_advanced`, `routing_advanced`). Both surfaces are reachable through `execute_tool`.
+To keep Claude's tool-list context clean, 16 commonly-used tools are exposed directly and 28 advanced tools are routed through 7 meta-tools (`project_admin`, `research`, `schematic_advanced`, `pcb_layout_advanced`, `routing_advanced`, `pcb_checks`, `fabrication`). Both surfaces are reachable through `execute_tool`. The fab DFM presets are also accessible via `run_drc(rules_preset="jlcpcb"|"pcbway"|"oshpark")` — the preset is applied to the project before DRC runs.
 
 Call `get_capabilities` first in a session to see which backends are live on the current machine.
 
@@ -98,7 +98,7 @@ The OSS-MCP-for-KiCad space is real and growing. Here's a fair-minded look at th
 
 | Project | License | Tools | Editing | DFM presets | Product framing |
 |---------|---------|-------|---------|-------------|-----------------|
-| **Boardwright** (this) | **MIT** | 41 (16 direct + 25 routed) | full schematic + PCB | JLC/PCBWay/OSH on roadmap | indie-maker, open-core, paid Studio tier |
+| **Boardwright** (this) | **MIT** | 44 (16 direct + 28 routed) | full schematic + PCB | **JLC / PCBWay / OSH bundled** | indie-maker, open-core, paid Studio tier |
 | [`oaslananka/kicad-mcp-pro`](https://github.com/oaslananka/kicad-mcp-pro) | MIT | 100+ across 11 categories | full | **bundled today** | tool, no product wrapper |
 | [`Seeed-Studio/kicad-mcp-server`](https://github.com/Seeed-Studio/kicad-mcp-server) | none declared | 39 | analysis prod, **editing experimental** | no | tool, Seeed brand backing |
 | [`bunnyf/pcb-mcp`](https://github.com/bunnyf/pcb-mcp) | **GPL-3.0** | 22 | PCB only | JLCPCB export bundle | tool |
@@ -171,4 +171,6 @@ See [docs/PROJECT.md](docs/PROJECT.md) for the full strategic plan: ICP, competi
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+The **source code** is MIT-licensed. See [LICENSE](LICENSE).
+
+The **names and brand** ("Boardwright", "Boardwright Studio", logos and visual identity) are trademarks of Jose Padilla. Forks, modifications, and commercial use of the *code* are explicitly permitted by MIT. Use of the *name* in a way that could confuse users about what they're getting requires permission. See [TRADEMARK.md](TRADEMARK.md) for details — it's short and reasonable.

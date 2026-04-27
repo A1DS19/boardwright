@@ -810,8 +810,19 @@ def _connectivity_arrange(footprints: list[dict], margin: float) -> list[dict]:
 def auto_arrange(
     margin_mm: float = 3.0,
     strategy: str = "connectivity",
+    board_w_mm: float = 100.0,
+    board_h_mm: float = 80.0,
+    iterations: int = 300,
 ) -> dict:
-    """Automatically arrange all footprints on the PCB based on netlist connectivity."""
+    """Automatically arrange all footprints on the PCB.
+
+    Strategies:
+      connectivity   — heuristic grouping by ratsnest (fast, deterministic).
+      grid           — simple row-major grid (no netlist needed).
+      force_directed — spring-embedder physics solver (best quality).
+                       Pulls connected components together, pushes all apart,
+                       respects soft board walls.
+    """
     pcb = _pcb_file()
     if not pcb:
         return {"status": "error", "message": "No pcb_file set. Call set_project first."}
@@ -821,12 +832,20 @@ def auto_arrange(
     if not footprints:
         return {"status": "error", "message": "No footprints found in PCB."}
 
-    placements = _compute_arrangement(footprints, margin_mm, strategy)
+    if strategy == "force_directed":
+        placements = _force_directed_arrangement(
+            footprints,
+            board_w_mm=board_w_mm,
+            board_h_mm=board_h_mm,
+            iterations=iterations,
+            margin_mm=margin_mm,
+        )
+    else:
+        placements = _compute_arrangement(footprints, margin_mm, strategy)
 
     for p in placements:
         pw.move_footprint(pcb, p["reference"], p["x"], p["y"], p["rotation"])
 
-    # Compute final bounding box
     all_x = [p["x"] for p in placements]
     all_y = [p["y"] for p in placements]
 
@@ -844,6 +863,73 @@ def auto_arrange(
         "placements": placements,
         "note": "Wrote placements to .kicad_pcb. Ensure pcbnew is closed.",
     }
+
+
+def _force_directed_arrangement(
+    footprints: list[dict],
+    board_w_mm: float,
+    board_h_mm: float,
+    iterations: int,
+    margin_mm: float,
+) -> list[dict]:
+    """Build PlacementComponents/Nets from the PCB and run the spring-embedder."""
+    from .. import placement as pl
+    from . import _pcb_writer as pw
+
+    comps: list[pl.PlacementComponent] = []
+    for fp in footprints:
+        x1, y1, x2, y2 = _footprint_bbox(fp)
+        w = max(x2 - x1, 1.0)
+        h = max(y2 - y1, 1.0)
+        ref = fp.get("reference") or fp.get("ref") or ""
+        # Mounting holes and connectors stay where the user placed them.
+        is_mount = ref.upper().startswith(("H", "MK", "MH"))
+        is_conn = ref.upper().startswith("J")
+        comps.append(pl.PlacementComponent(
+            ref=ref,
+            x=fp.get("x", 0.0),
+            y=fp.get("y", 0.0),
+            w=w,
+            h=h,
+            fixed=bool(is_mount or is_conn),
+        ))
+
+    # Best-effort netlist extraction. _pcb_writer may or may not expose this;
+    # if it doesn't, run the solver in repulsion-only mode.
+    nets: list[pl.PlacementNet] = []
+    if hasattr(pw, "read_netlist"):
+        try:
+            raw_nets = pw.read_netlist(_pcb_file())
+            for name, refs in (raw_nets or {}).items():
+                if name in {"", "GND", "+3V3", "+5V", "VCC", "VBUS"}:
+                    # Skip power/ground rails — they connect everything; without
+                    # weighting them down we'd collapse the whole board.
+                    continue
+                if len(refs) >= 2:
+                    nets.append(pl.PlacementNet(name=name, refs=list(refs), weight=1.0))
+        except Exception:  # noqa: BLE001
+            nets = []
+
+    cfg = pl.ForceDirectedConfig(
+        iterations=iterations,
+        board_w=board_w_mm,
+        board_h=board_h_mm,
+    )
+    solved = pl.force_directed_placement(comps, nets, cfg)
+
+    # Write back as the dict shape _compute_arrangement returns.
+    placements = []
+    for c in solved:
+        # Apply margin shift if any component would land too close to the edge.
+        x = max(margin_mm + c.w / 2.0, c.x)
+        y = max(margin_mm + c.h / 2.0, c.y)
+        placements.append({
+            "reference": c.ref,
+            "x": round(x, 2),
+            "y": round(y, 2),
+            "rotation": 0.0,
+        })
+    return placements
 
 
 # ─── Fit board outline ────────────────────────────────────────────────────
@@ -1093,7 +1179,13 @@ TOOL_SCHEMAS = [
     },
     {
         "name": "auto_arrange",
-        "description": "Automatically arrange all footprints on the PCB based on netlist connectivity. Groups decoupling caps near their ICs, places connectors on periphery, crystals near their IC, and spaces components to avoid overlap.",
+        "description": (
+            "Automatically arrange all footprints on the PCB. "
+            "Three strategies: 'connectivity' (heuristic grouping by ratsnest, fast, deterministic), "
+            "'grid' (simple row/column layout, no netlist needed), "
+            "'force_directed' (spring-embedder physics solver — connected components attract, "
+            "all components repel, soft board walls. Best layout quality on small/medium designs)."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1104,9 +1196,28 @@ TOOL_SCHEMAS = [
                 },
                 "strategy": {
                     "type": "string",
-                    "enum": ["connectivity", "grid"],
+                    "enum": ["connectivity", "grid", "force_directed"],
                     "default": "connectivity",
-                    "description": "'connectivity' groups by netlist connections, 'grid' uses simple row/column layout"
+                    "description": (
+                        "'connectivity' groups by netlist connections (default, fast); "
+                        "'grid' is row/column layout; "
+                        "'force_directed' runs the spring-embedder solver."
+                    )
+                },
+                "board_w_mm": {
+                    "type": "number",
+                    "default": 100.0,
+                    "description": "Soft board width for force_directed solver (ignored by other strategies)."
+                },
+                "board_h_mm": {
+                    "type": "number",
+                    "default": 80.0,
+                    "description": "Soft board height for force_directed solver (ignored by other strategies)."
+                },
+                "iterations": {
+                    "type": "integer",
+                    "default": 300,
+                    "description": "Solver iterations for force_directed strategy. 200-500 typical; higher = more refined but slower."
                 }
             }
         }

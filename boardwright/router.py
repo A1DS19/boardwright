@@ -32,6 +32,7 @@ DIRECT_TOOL_NAMES: set[str] = {
     "list_directory",
     "read_file",
     "search_components",
+    "search_components_lcsc",
     "create_schematic_sheet",
     "add_symbol",
     "connect_pins",
@@ -49,8 +50,14 @@ DIRECT_TOOL_NAMES: set[str] = {
 TOOL_CATEGORIES: list[dict[str, Any]] = [
     {
         "name": "project_admin",
-        "description": "DRC rule tuning and exclusion management.",
-        "tools": ["set_drc_severity", "add_drc_exclusion"],
+        "description": "DRC rule tuning, exclusions, and fab DFM profiles.",
+        "tools": [
+            "set_drc_severity",
+            "add_drc_exclusion",
+            "dfm_apply_jlcpcb",
+            "dfm_apply_pcbway",
+            "dfm_apply_oshpark",
+        ],
     },
     {
         "name": "research",
