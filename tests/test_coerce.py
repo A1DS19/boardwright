@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from kicad_agent.dispatcher import _coerce_input, _coerce_scalar
+from boardwright.dispatcher import _coerce_input, _coerce_scalar
 
 
 def _schema(props: dict) -> dict:

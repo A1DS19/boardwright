@@ -1,0 +1,272 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/inter";
+
+/*
+  ─────────────────────────────────────────────────────────────────────────────
+  Boardwright — brand & style guide
+  ─────────────────────────────────────────────────────────────────────────────
+
+  Identity
+    AI-native KiCad. The brand reads technical, precise, and hardware-rooted —
+    pitched at indie makers and the KiCad community first, prosumers next.
+
+  Color
+    Primary accent is PCB-trace green. The choice is deliberate:
+      • Instantly recognizable to anyone who has held a fabricated board.
+      • Differentiates from the violet/cyan defaults of most AI tools.
+      • Pairs cleanly with copper / amber as a secondary if we ever need it.
+
+    Backgrounds and text are true neutrals with a barely-perceptible cool/green
+    bias so the green accent feels native rather than tacked on.
+
+  Typography
+    Inter Variable for body and display. We use Inter for the mono fallback
+    today; can swap in JetBrains Mono Variable for code chips later without
+    disturbing layout.
+
+  Shape
+    Base radius 0.625rem (shadcn default). Generous whitespace. Subtle green
+    radial glow on the hero. The .brand-grid background is a fine grid with
+    via-style dots at intersections — reads as PCB at a glance.
+
+  Tokens
+    Light mode is high-contrast white with a microscopic green tint; dark mode
+    is near-black, also slightly green-biased, so the trace-green accent
+    doesn't fight the page. The brand* tokens extend shadcn's defaults with
+    surfaces used by the marketing site (hero glow, header chip, link hover).
+  ─────────────────────────────────────────────────────────────────────────────
+*/
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --font-heading: var(--font-sans);
+  --font-sans: 'Inter Variable', sans-serif;
+  --font-mono: 'Inter Variable', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+
+  --color-brand: var(--brand);
+  --color-brand-foreground: var(--brand-foreground);
+  --color-brand-muted: var(--brand-muted);
+
+  --color-copper: var(--copper);
+
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+  /* Backgrounds — barely-perceptible cool/green bias so trace-green feels native */
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.18 0.005 155);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.18 0.005 155);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.18 0.005 155);
+
+  /* Brand: PCB-trace green */
+  --brand: oklch(0.62 0.15 152);
+  --brand-foreground: oklch(0.99 0.01 155);
+  --brand-muted: oklch(0.95 0.05 152);
+
+  /* Secondary accent: copper trace (used sparingly — links, highlights) */
+  --copper: oklch(0.68 0.13 55);
+
+  /* shadcn primary mapped to brand for default buttons / focus rings */
+  --primary: oklch(0.62 0.15 152);
+  --primary-foreground: oklch(0.99 0.01 155);
+
+  --secondary: oklch(0.96 0.005 155);
+  --secondary-foreground: oklch(0.22 0.005 155);
+  --muted: oklch(0.96 0.005 155);
+  --muted-foreground: oklch(0.50 0.01 155);
+  --accent: oklch(0.95 0.05 152);
+  --accent-foreground: oklch(0.30 0.06 152);
+
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.91 0.005 155);
+  --input: oklch(0.91 0.005 155);
+  --ring: oklch(0.62 0.15 152);
+
+  --chart-1: oklch(0.62 0.15 152);
+  --chart-2: oklch(0.55 0.13 152);
+  --chart-3: oklch(0.45 0.10 152);
+  --chart-4: oklch(0.68 0.13 55);
+  --chart-5: oklch(0.30 0.05 152);
+
+  --radius: 0.625rem;
+
+  --sidebar: oklch(0.985 0.005 155);
+  --sidebar-foreground: oklch(0.18 0.005 155);
+  --sidebar-primary: oklch(0.62 0.15 152);
+  --sidebar-primary-foreground: oklch(0.99 0.01 155);
+  --sidebar-accent: oklch(0.96 0.005 155);
+  --sidebar-accent-foreground: oklch(0.22 0.005 155);
+  --sidebar-border: oklch(0.91 0.005 155);
+  --sidebar-ring: oklch(0.62 0.15 152);
+}
+
+.dark {
+  /* Near-black background with a barely-perceptible cool/green tint */
+  --background: oklch(0.13 0.008 155);
+  --foreground: oklch(0.97 0.005 155);
+  --card: oklch(0.17 0.008 155);
+  --card-foreground: oklch(0.97 0.005 155);
+  --popover: oklch(0.17 0.008 155);
+  --popover-foreground: oklch(0.97 0.005 155);
+
+  /* Brand glows slightly brighter in dark mode so it pops off the near-black */
+  --brand: oklch(0.72 0.16 152);
+  --brand-foreground: oklch(0.13 0.04 152);
+  --brand-muted: oklch(0.30 0.08 152 / 35%);
+
+  --copper: oklch(0.74 0.13 55);
+
+  --primary: oklch(0.72 0.16 152);
+  --primary-foreground: oklch(0.13 0.04 152);
+
+  --secondary: oklch(0.24 0.008 155);
+  --secondary-foreground: oklch(0.97 0.005 155);
+  --muted: oklch(0.24 0.008 155);
+  --muted-foreground: oklch(0.68 0.01 155);
+  --accent: oklch(0.30 0.08 152 / 35%);
+  --accent-foreground: oklch(0.92 0.06 152);
+
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 12%);
+  --ring: oklch(0.72 0.16 152);
+
+  --chart-1: oklch(0.72 0.16 152);
+  --chart-2: oklch(0.62 0.14 152);
+  --chart-3: oklch(0.50 0.11 152);
+  --chart-4: oklch(0.74 0.13 55);
+  --chart-5: oklch(0.30 0.05 152);
+
+  --sidebar: oklch(0.17 0.008 155);
+  --sidebar-foreground: oklch(0.97 0.005 155);
+  --sidebar-primary: oklch(0.72 0.16 152);
+  --sidebar-primary-foreground: oklch(0.13 0.04 152);
+  --sidebar-accent: oklch(0.24 0.008 155);
+  --sidebar-accent-foreground: oklch(0.97 0.005 155);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.72 0.16 152);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+  html {
+    @apply font-sans;
+  }
+}
+
+@layer components {
+  /* Container width used across the marketing site */
+  .page-wrap {
+    @apply mx-auto w-full max-w-6xl;
+  }
+
+  /* Small uppercase eyebrow text used above section headings */
+  .eyebrow {
+    @apply text-xs font-semibold uppercase tracking-[0.18em] text-brand;
+  }
+
+  /* Header/footer/CTA chip used for pill-shaped links */
+  .chip {
+    @apply inline-flex items-center gap-2 rounded-full border border-border bg-card px-3 py-1.5 text-sm font-medium text-foreground transition-colors hover:bg-muted;
+  }
+
+  /* Header navigation link */
+  .nav-link {
+    @apply inline-flex items-center rounded-md px-2.5 py-1.5 text-sm font-medium text-muted-foreground transition-colors hover:text-foreground;
+  }
+  .nav-link.is-active {
+    @apply text-foreground;
+  }
+
+  /* Subtle radial green glow used behind the hero and final CTA */
+  .brand-glow {
+    background:
+      radial-gradient(60% 50% at 50% 0%, color-mix(in oklch, var(--brand) 22%, transparent) 0%, transparent 70%),
+      radial-gradient(40% 35% at 80% 20%, color-mix(in oklch, var(--brand) 14%, transparent) 0%, transparent 70%);
+  }
+
+  /*
+    PCB-trace background grid: a fine orthogonal grid + small via-style dots
+    at every intersection. Reads as "PCB" without being literal.
+  */
+  .brand-grid {
+    background-image:
+      linear-gradient(to right, var(--border) 1px, transparent 1px),
+      linear-gradient(to bottom, var(--border) 1px, transparent 1px),
+      radial-gradient(circle, color-mix(in oklch, var(--brand) 45%, transparent) 1.4px, transparent 1.6px);
+    background-size: 44px 44px, 44px 44px, 44px 44px;
+    background-position: 0 0, 0 0, 0 0;
+    mask-image: radial-gradient(ellipse at center, black 25%, transparent 70%);
+  }
+
+  /* Inline keyboard-style chip used in copy */
+  .kbd {
+    @apply inline-flex h-6 min-w-6 items-center justify-center rounded-md border border-border bg-card px-1.5 font-mono text-[11px] font-medium text-muted-foreground;
+  }
+
+  /* Display heading: tight tracking, max readability */
+  .display-title {
+    @apply font-heading text-4xl font-semibold tracking-tight text-foreground sm:text-5xl md:text-6xl;
+    text-wrap: balance;
+    line-height: 1.04;
+  }
+
+  /* Lead paragraph used under the headline */
+  .lead {
+    @apply text-base text-muted-foreground sm:text-lg;
+    text-wrap: pretty;
+  }
+}

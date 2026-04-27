@@ -59,7 +59,7 @@ def fake_backend(monkeypatch):
     monkeypatch.setenv("KICAD_MCP_FAKE_BACKEND", "1")
     monkeypatch.setattr(shutil, "which", lambda name: None)
 
-    from kicad_agent import state
+    from boardwright import state
     state.reset_state()
     yield
     state.reset_state()

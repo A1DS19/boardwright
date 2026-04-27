@@ -330,6 +330,78 @@ def read_pad_positions(pcb_path: str, reference: str) -> list[dict]:
     return []
 
 
+# ─── Bulk footprint reader ─────────────────────────────────────────────────
+
+def read_all_footprints(pcb_path: str) -> list[dict]:
+    """Read every footprint in one pass. Returns list of dicts:
+    {reference, footprint_lib, x, y, rotation, pads: [{number, net, local_x, local_y, pad_w, pad_h}]}
+    Pad coords are footprint-local (before rotation). Use for bounding-box and connectivity analysis.
+    """
+    text = _read(pcb_path)
+    results = []
+    for _s, _e, block in _iter_footprint_blocks(text):
+        ref_m = re.search(r'\(property "Reference" "([^"]+)"', block)
+        if not ref_m:
+            continue
+        reference = ref_m.group(1)
+
+        # Footprint library name from first line
+        lib_m = re.match(r'\(footprint "([^"]*)"', block)
+        lib_name = lib_m.group(1) if lib_m else ""
+
+        # Position
+        at_m = re.search(
+            r'\A[^\n]*\n\s*\(layer[^\n]*\n\s*\(uuid[^\n]*\n\s*'
+            r'\(at ([\d.\-]+)\s+([\d.\-]+)(?:\s+([\d.\-]+))?\)', block)
+        if not at_m:
+            continue
+        fx, fy = float(at_m.group(1)), float(at_m.group(2))
+        frot = float(at_m.group(3) or 0)
+
+        # Parse pads
+        pads = []
+        i = 0
+        while True:
+            idx = block.find('(pad "', i)
+            if idx < 0:
+                break
+            depth = 0
+            for j in range(idx, len(block)):
+                if block[j] == '(':
+                    depth += 1
+                elif block[j] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        pad_text = block[idx:j + 1]
+                        i = j + 1
+                        break
+            else:
+                break
+
+            num_m = re.match(r'\(pad "([^"]*)"', pad_text)
+            at_p = re.search(r'\(at ([\d.\-]+)\s+([\d.\-]+)(?:\s+([\d.\-]+))?\)', pad_text)
+            net_m = re.search(r'\(net \d+ "([^"]*)"\)', pad_text)
+            size_m = re.search(r'\(size ([\d.\-]+)\s+([\d.\-]+)\)', pad_text)
+            if not num_m or not at_p:
+                continue
+            pads.append({
+                "number": num_m.group(1),
+                "net": net_m.group(1) if net_m else "",
+                "local_x": float(at_p.group(1)),
+                "local_y": float(at_p.group(2)),
+                "pad_w": float(size_m.group(1)) if size_m else 1.0,
+                "pad_h": float(size_m.group(2)) if size_m else 1.0,
+            })
+
+        results.append({
+            "reference": reference,
+            "footprint_lib": lib_name,
+            "x": fx, "y": fy, "rotation": frot,
+            "pads": pads,
+        })
+    return results
+
+
 # ─── Segments (traces) ─────────────────────────────────────────────────────
 
 def append_segments(
@@ -377,6 +449,48 @@ def append_via(
     )
     text = _insert_before_final_paren(text, block)
     _write(pcb_path, text)
+
+
+def strip_tracks(pcb_path: str) -> int:
+    """Remove all top-level (segment ...), (via ...), and (arc ...) track blocks.
+    Handles both single-line and multi-line formats via paren-balance walking.
+    Returns count of blocks removed."""
+    text = _read(pcb_path)
+    pattern = re.compile(r'\n\t\((?:segment|via|arc)(?=[\s\n\t)])')
+    removed = 0
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        m = pattern.search(text, i)
+        if not m:
+            out.append(text[i:])
+            break
+        # m.start() points at the '\n' before '\t('; the block itself starts after it.
+        block_start = m.start() + 1
+        out.append(text[i:block_start])
+        depth = 0
+        j = block_start
+        while j < n:
+            c = text[j]
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    j += 1
+                    break
+            j += 1
+        # Trim trailing whitespace accumulated before the block.
+        while out and out[-1] and out[-1][-1] in " \t\n":
+            out[-1] = out[-1][:-1]
+        removed += 1
+        # Skip trailing whitespace after the closing paren so the file stays tidy.
+        while j < n and text[j] in " \t":
+            j += 1
+        i = j
+    _write(pcb_path, "".join(out))
+    return removed
 
 
 # ─── Pad resolution for route_trace 'REF:PIN' syntax ───────────────────────

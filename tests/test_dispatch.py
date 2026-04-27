@@ -15,7 +15,7 @@ import json
 
 import pytest
 
-from kicad_agent import dispatcher
+from boardwright import dispatcher
 
 
 @pytest.mark.parametrize("tool_name", sorted(dispatcher.ALL_HANDLERS))
@@ -42,5 +42,5 @@ def test_set_project_roundtrip(tmp_path):
     result = dispatcher.dispatch_tool("set_project", {"pcb_file": str(pcb)})
     assert result["status"] == "ok"
 
-    from kicad_agent import state
+    from boardwright import state
     assert state._pcb_file() == str(pcb)

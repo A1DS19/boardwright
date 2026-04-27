@@ -1,7 +1,8 @@
+# Runtime requirements are declared in pyproject.toml.
+# This file exists only for tooling that prefers requirements.txt.
+# Install via:  pip install -e .
 mcp>=1.0.0
 kicad-python>=0.6.0
-starlette>=0.40.0,<0.42.0
-sse-starlette>=1.6.1,<2.0
 requests>=2.31.0
-python-dotenv>=1.0.0
 pdfplumber>=0.10.0
+python-dotenv>=1.0.0

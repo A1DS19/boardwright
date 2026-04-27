@@ -77,7 +77,7 @@ TOOL_CATEGORIES: list[dict[str, Any]] = [
     },
     {
         "name": "pcb_layout_advanced",
-        "description": "Mounting holes, ratsnest queries, keep-out and copper zones.",
+        "description": "Mounting holes, ratsnest queries, keep-out and copper zones, auto-arrangement.",
         "tools": [
             "add_mounting_holes",
             "get_ratsnest",
@@ -86,9 +86,12 @@ TOOL_CATEGORIES: list[dict[str, Any]] = [
             "fill_zones",
             "strip_edge_cuts",
             "strip_zones",
+            "strip_tracks",
             "save_board",
             "get_pad_positions",
             "sync_pcb_from_schematic",
+            "auto_arrange",
+            "fit_board_outline",
         ],
     },
     {

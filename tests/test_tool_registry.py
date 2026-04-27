@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import jsonschema
 
-from kicad_agent import dispatcher, router
+from boardwright import dispatcher, router
 
 
 def test_every_schema_has_a_handler():

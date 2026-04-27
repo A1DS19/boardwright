@@ -62,17 +62,15 @@ def _try_kipy(fn):
     """
     Call *fn* (which should use _kicad() internally).
     Returns the result dict on success, or None if kipy is unavailable
-    (signalling the caller to fall through to the stub path).
-    Hard errors (non-connection) are returned as error dicts.
+    (signalling the caller to fall through to the file-write fallback or
+    stub path). Hard errors (non-connection) are returned as error dicts.
     """
     try:
         return fn()
     except ImportError:
         return None
     except Exception as e:
-        if "connect" in str(e).lower() or "socket" in str(e).lower():
-            return {
-                "status": "error",
-                "message": "KiCad is not running. Open the PCB in KiCad then retry.",
-            }
+        msg = str(e).lower()
+        if "connect" in msg or "socket" in msg or "not running" in msg:
+            return None
         return {"status": "error", "message": f"kipy error: {e}"}

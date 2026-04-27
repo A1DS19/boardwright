@@ -1,22 +1,68 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "kicad-ai"
-version = "0.2.0"
+name = "boardwright"
+version = "0.3.0"
+description = "AI-native KiCad. An MCP server that lets Claude drive your KiCad install through 41 tools across the full PCB workflow."
+readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
+authors = [{ name = "Boardwright contributors" }]
+keywords = ["kicad", "pcb", "eda", "mcp", "ai", "claude", "hardware"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Manufacturing",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
+]
 dependencies = [
     "mcp>=1.0.0",
     "kicad-python>=0.6.0",
+    "requests>=2.31.0",
+    "pdfplumber>=0.10.0",
+    "python-dotenv>=1.0.0",
 ]
 
 [project.optional-dependencies]
 test = ["pytest>=7", "jsonschema>=4"]
+dev = ["pytest>=7", "jsonschema>=4", "ruff>=0.6", "mypy>=1.10"]
+
+[project.scripts]
+boardwright-mcp = "boardwright.server:main"
+
+[project.urls]
+Homepage = "https://boardwright.dev"
+Source = "https://github.com/A1DS19/boardwright"
+Issues = "https://github.com/A1DS19/boardwright/issues"
 
 [tool.setuptools.packages.find]
-where = ["."]
+include = ["boardwright*"]
+exclude = ["tests*", "examples*", "web*", "docs*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["examples", "web", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+exclude = ["examples/", "web/", "tests/"]

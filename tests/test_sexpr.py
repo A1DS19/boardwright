@@ -8,13 +8,13 @@ from __future__ import annotations
 
 import math
 
-from kicad_agent.schematic_io import (
+from boardwright.schematic_io import (
     _resolve_pin_endpoint,
     _sch_lib_symbols,
     _sch_placed_symbols,
     _transform_pin,
 )
-from kicad_agent.sexpr import (
+from boardwright.sexpr import (
     _parse_sexpr,
     _sx_find,
     _sx_findall,
@@ -78,7 +78,7 @@ def test_resolve_pin_endpoint_from_fixture(tmp_sch):
 
 
 def test_parse_placed_and_lib_symbols(tmp_sch):
-    from kicad_agent.schematic_io import _parse_sch_file
+    from boardwright.schematic_io import _parse_sch_file
     tree = _parse_sch_file(str(tmp_sch))
     placed = _sch_placed_symbols(tree)
     assert "R1" in placed

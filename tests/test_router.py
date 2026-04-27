@@ -7,7 +7,7 @@ execute_tool. These tests lock that contract in place.
 
 from __future__ import annotations
 
-from kicad_agent import dispatcher, router
+from boardwright import dispatcher, router
 
 
 def test_list_tool_categories():

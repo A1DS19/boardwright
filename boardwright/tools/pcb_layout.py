@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import tempfile
 from pathlib import Path
 
@@ -202,6 +203,24 @@ def place_footprint(
     result = _try_kipy(_kipy_place)
     if result is not None:
         return result
+
+    # File-write fallback
+    pcb = _pcb_file()
+    if pcb:
+        from . import _pcb_writer as pw
+        hit = pw.move_footprint(pcb, reference, x_mm, y_mm, rotation_deg)
+        if not hit:
+            return {"status": "error",
+                    "message": f"Footprint '{reference}' not found in .kicad_pcb."}
+        _project_state["placements"][reference] = {
+            "x": x_mm, "y": y_mm, "rotation": rotation_deg, "layer": layer,
+        }
+        return {
+            "status": "ok", "source": "file",
+            "reference": reference, "x_mm": x_mm, "y_mm": y_mm,
+            "rotation_deg": rotation_deg, "layer": layer,
+            "note": "Wrote placement to .kicad_pcb. Ensure pcbnew is closed.",
+        }
 
     _project_state["placements"][reference] = {
         "x": x_mm, "y": y_mm, "rotation": rotation_deg, "layer": layer,
@@ -465,6 +484,440 @@ def strip_zones() -> dict:
     return {"status": "ok", "removed": n}
 
 
+def strip_tracks() -> dict:
+    """Remove all track segments, arcs, and vias from the PCB (file write). Returns count removed."""
+    pcb = _pcb_file()
+    if not pcb:
+        return {"status": "error", "message": "No pcb_file set."}
+    from . import _pcb_writer as pw
+    n = pw.strip_tracks(pcb)
+    return {"status": "ok", "removed": n}
+
+
+# ─── Power net heuristic ───────────────────────────────────────────────────
+
+_POWER_PATTERNS = {"GND", "VCC", "VDD", "VSS", "VBUS", "VBAT", "VIN"}
+
+
+def _is_power_net(name: str) -> bool:
+    """Return True for nets that are power/ground (not useful for grouping)."""
+    n = name.lstrip("/").upper()
+    if n in _POWER_PATTERNS:
+        return True
+    # +3V3, +5V, +12V, +3.3V, etc.
+    if n.startswith("+") and any(c.isdigit() for c in n):
+        return True
+    return False
+
+
+# ─── Bounding box from footprint pad data ──────────────────────────────────
+
+def _footprint_bbox(fp: dict) -> tuple[float, float, float, float]:
+    """Return (half_w, half_h, abs_min_x, abs_min_y, abs_max_x, abs_max_y)
+    for a footprint dict from read_all_footprints. Accounts for rotation."""
+    pads = fp["pads"]
+    if not pads:
+        return 1.0, 1.0  # minimum fallback
+
+    rot = math.radians(fp["rotation"])
+    cos_t, sin_t = math.cos(rot), math.sin(rot)
+
+    xs, ys = [], []
+    for p in pads:
+        lx, ly = p["local_x"], p["local_y"]
+        pw, ph = p["pad_w"] / 2, p["pad_h"] / 2
+        # Rotated corners of pad extent
+        ax = fp["x"] + (lx * cos_t - ly * sin_t)
+        ay = fp["y"] + (lx * sin_t + ly * cos_t)
+        xs.extend([ax - pw, ax + pw])
+        ys.extend([ay - ph, ay + ph])
+
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _bbox_size(fp: dict) -> tuple[float, float]:
+    """Return (width, height) of footprint bounding box."""
+    x1, y1, x2, y2 = _footprint_bbox(fp)
+    return x2 - x1, y2 - y1
+
+
+def _bboxes_overlap(a: tuple, b: tuple) -> bool:
+    """Check if two (x1,y1,x2,y2) bounding boxes overlap."""
+    return a[0] < b[2] and a[2] > b[0] and a[1] < b[3] and a[3] > b[1]
+
+
+# ─── Auto-arrange ─────────────────────────────────────────────────────────
+
+def _compute_arrangement(
+    footprints: list[dict], margin_mm: float, strategy: str,
+) -> list[dict]:
+    """Pure logic: returns list of {reference, x, y, rotation} placements."""
+    if strategy == "grid":
+        return _grid_arrange(footprints, margin_mm)
+    return _connectivity_arrange(footprints, margin_mm)
+
+
+def _grid_arrange(footprints: list[dict], margin: float) -> list[dict]:
+    """Simple grid layout sorted by category then reference."""
+    def sort_key(fp):
+        ref = fp["reference"]
+        prefix = "".join(c for c in ref if c.isalpha())
+        num = "".join(c for c in ref if c.isdigit())
+        order = {"U": 0, "J": 1, "Y": 2, "D": 3, "Q": 4,
+                 "L": 5, "C": 6, "R": 7}
+        return (order.get(prefix, 8), int(num) if num else 0)
+
+    sorted_fps = sorted(footprints, key=sort_key)
+    placements = []
+    x, y = margin, margin
+    row_height = 0.0
+    max_row_width = 90.0  # reasonable default max width
+
+    for fp in sorted_fps:
+        w, h = _bbox_size(fp)
+        w += margin
+        h += margin
+
+        if x + w > max_row_width and x > margin:
+            x = margin
+            y += row_height
+            row_height = 0.0
+
+        placements.append({
+            "reference": fp["reference"],
+            "x": round(x + w / 2, 2),
+            "y": round(y + h / 2, 2),
+            "rotation": fp["rotation"],
+        })
+        x += w
+        row_height = max(row_height, h)
+
+    return placements
+
+
+def _connectivity_arrange(footprints: list[dict], margin: float) -> list[dict]:
+    """Place components grouped by netlist connectivity."""
+    fp_map = {fp["reference"]: fp for fp in footprints}
+
+    # Build connectivity: ref -> set of connected refs (signal nets only)
+    net_to_refs: dict[str, set[str]] = {}
+    for fp in footprints:
+        for pad in fp["pads"]:
+            net = pad["net"]
+            if net and not _is_power_net(net):
+                net_to_refs.setdefault(net, set()).add(fp["reference"])
+
+    connectivity: dict[str, set[str]] = {ref: set() for ref in fp_map}
+    for refs in net_to_refs.values():
+        for r in refs:
+            connectivity[r] |= refs - {r}
+
+    # Also track power connections for decoupling cap detection
+    power_net_to_refs: dict[str, set[str]] = {}
+    for fp in footprints:
+        for pad in fp["pads"]:
+            net = pad["net"]
+            if net and _is_power_net(net):
+                power_net_to_refs.setdefault(net, set()).add(fp["reference"])
+
+    # Classify components
+    ics = [r for r in fp_map if r[0] == "U"]
+    connectors = [r for r in fp_map if r[0] == "J"]
+    crystals = [r for r in fp_map if r[0] in ("Y", "X")]
+    switches = [r for r in fp_map if r.startswith("SW")]
+
+    # Find decoupling caps: C* that shares a power net with an IC.
+    # Each cap is assigned to at most one IC (the one it shares the most nets with).
+    decoupling: dict[str, list[str]] = {ic: [] for ic in ics}
+    caps = [r for r in fp_map if r[0] == "C"]
+    assigned = set()
+    # Sort ICs by signal connection count (main IC first) so it gets priority
+    sorted_ics = sorted(ics, key=lambda r: len(connectivity.get(r, set())), reverse=True)
+    for ic in sorted_ics:
+        for cap in caps:
+            if cap in assigned:
+                continue
+            shares_power = any(
+                ic in refs and cap in refs
+                for refs in power_net_to_refs.values()
+            )
+            if not shares_power:
+                continue
+            shares_signal = cap in connectivity.get(ic, set())
+            cap_nets = {p["net"] for p in fp_map[cap]["pads"] if p["net"]}
+            all_power = all(_is_power_net(n) for n in cap_nets)
+            if shares_signal or all_power:
+                decoupling[ic].append(cap)
+                assigned.add(cap)
+
+    remaining = [
+        r for r in fp_map
+        if r not in set(ics) | set(connectors) | set(crystals) | set(switches) | assigned
+    ]
+
+    # Placement state
+    placements: list[dict] = []
+    placed_bboxes: list[tuple[float, float, float, float]] = []
+    placed_positions: dict[str, tuple[float, float]] = {}
+
+    def _place(ref: str, cx: float, cy: float, rot: float | None = None):
+        fp = fp_map[ref]
+        r = rot if rot is not None else fp["rotation"]
+        # Temporarily update fp position for bbox calculation
+        old_x, old_y = fp["x"], fp["y"]
+        fp["x"], fp["y"] = cx, cy
+        bbox = _footprint_bbox(fp)
+        fp["x"], fp["y"] = old_x, old_y
+
+        # Check collisions and nudge
+        cx, cy, bbox = _find_free_spot(cx, cy, bbox, placed_bboxes, margin)
+
+        placements.append({"reference": ref, "x": round(cx, 2),
+                           "y": round(cy, 2), "rotation": r})
+        placed_bboxes.append(bbox)
+        placed_positions[ref] = (cx, cy)
+
+    def _find_free_spot(cx, cy, bbox, existing, m):
+        """Nudge position until no overlap with existing bboxes."""
+        w = bbox[2] - bbox[0]
+        h = bbox[3] - bbox[1]
+        for attempt in range(50):
+            test_bbox = (cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
+            collision = False
+            for eb in existing:
+                eb_padded = (eb[0] - m, eb[1] - m, eb[2] + m, eb[3] + m)
+                if _bboxes_overlap(test_bbox, eb_padded):
+                    collision = True
+                    # Nudge away from collision
+                    dx = (test_bbox[2] + test_bbox[0]) / 2 - (eb[2] + eb[0]) / 2
+                    dy = (test_bbox[3] + test_bbox[1]) / 2 - (eb[3] + eb[1]) / 2
+                    dist = math.hypot(dx, dy) or 1.0
+                    nudge = max(w, h) * 0.5 + m
+                    cx += dx / dist * nudge
+                    cy += dy / dist * nudge
+                    break
+            if not collision:
+                break
+        final_bbox = (cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
+        return cx, cy, final_bbox
+
+    # Phase A: Place main IC at center (50, 35 is a reasonable starting point)
+    center_x, center_y = 45.0, 35.0
+    if ics:
+        # Pick IC with most signal connections
+        main_ic = max(ics, key=lambda r: len(connectivity.get(r, set())))
+        _place(main_ic, center_x, center_y)
+        other_ics = [r for r in ics if r != main_ic]
+    else:
+        main_ic = None
+        other_ics = []
+
+    # Phase B: Place decoupling caps around their IC
+    if main_ic and decoupling.get(main_ic):
+        ic_w, ic_h = _bbox_size(fp_map[main_ic])
+        cap_list = decoupling[main_ic]
+        angles = [i * 2 * math.pi / max(len(cap_list), 1) for i in range(len(cap_list))]
+        radius = max(ic_w, ic_h) / 2 + margin + 2.0
+        for cap_ref, angle in zip(cap_list, angles):
+            cx = placed_positions[main_ic][0] + radius * math.cos(angle)
+            cy = placed_positions[main_ic][1] + radius * math.sin(angle)
+            _place(cap_ref, cx, cy)
+
+    # Phase C: Place crystals near their connected IC
+    for crystal in crystals:
+        target_ic = None
+        for ic in ics:
+            if ic in connectivity.get(crystal, set()):
+                target_ic = ic
+                break
+        if target_ic and target_ic in placed_positions:
+            ix, iy = placed_positions[target_ic]
+            ic_w, ic_h = _bbox_size(fp_map[target_ic])
+            _place(crystal, ix - ic_w / 2 - margin - 3, iy + ic_h / 2 + margin)
+        else:
+            _place(crystal, center_x - 15, center_y + 10)
+
+    # Phase D: Place other ICs
+    for i, ic in enumerate(other_ics):
+        offset = (i + 1) * 25
+        _place(ic, center_x + offset, center_y)
+        # Place their decoupling caps
+        if decoupling.get(ic):
+            ic_w, ic_h = _bbox_size(fp_map[ic])
+            cap_list = decoupling[ic]
+            angles = [j * 2 * math.pi / max(len(cap_list), 1) for j in range(len(cap_list))]
+            radius = max(ic_w, ic_h) / 2 + margin + 2.0
+            for cap_ref, angle in zip(cap_list, angles):
+                cx = placed_positions[ic][0] + radius * math.cos(angle)
+                cy = placed_positions[ic][1] + radius * math.sin(angle)
+                _place(cap_ref, cx, cy)
+
+    # Phase E: Place connectors along edges
+    conn_y = margin + 5
+    for i, conn in enumerate(connectors):
+        conn_w, conn_h = _bbox_size(fp_map[conn])
+        _place(conn, margin + conn_w / 2 + 2, conn_y)
+        conn_y += conn_h + margin + 2
+
+    # Phase F: Place switches
+    for i, sw in enumerate(switches):
+        target = None
+        for neighbor in connectivity.get(sw, set()):
+            if neighbor in placed_positions:
+                target = neighbor
+                break
+        if target:
+            tx, ty = placed_positions[target]
+            _place(sw, tx, ty + 20 + i * 10)
+        else:
+            _place(sw, center_x + i * 15, center_y + 25)
+
+    # Phase G: Place remaining passives near their most-connected placed neighbor
+    remain_offset = 0
+    for ref in remaining:
+        best = None
+        best_score = -1
+        for neighbor in connectivity.get(ref, set()):
+            if neighbor in placed_positions:
+                score = len(connectivity.get(ref, set()) & connectivity.get(neighbor, set()))
+                if score > best_score:
+                    best = neighbor
+                    best_score = score
+        if best:
+            bx, by = placed_positions[best]
+            # Spread around the neighbor using angle offset
+            angle = remain_offset * math.pi / 3
+            radius = margin + 5
+            _place(ref, bx + radius * math.cos(angle), by + radius * math.sin(angle))
+        else:
+            _place(ref, center_x + 20 + remain_offset * 6, center_y + 20)
+        remain_offset += 1
+
+    # Post-process: shift everything so nothing is at negative coordinates
+    if placements:
+        min_x = min(p["x"] for p in placements) - margin
+        min_y = min(p["y"] for p in placements) - margin
+        shift_x = max(0, margin - min_x)
+        shift_y = max(0, margin - min_y)
+        if shift_x > 0 or shift_y > 0:
+            for p in placements:
+                p["x"] = round(p["x"] + shift_x, 2)
+                p["y"] = round(p["y"] + shift_y, 2)
+
+    return placements
+
+
+def auto_arrange(
+    margin_mm: float = 3.0,
+    strategy: str = "connectivity",
+) -> dict:
+    """Automatically arrange all footprints on the PCB based on netlist connectivity."""
+    pcb = _pcb_file()
+    if not pcb:
+        return {"status": "error", "message": "No pcb_file set. Call set_project first."}
+
+    from . import _pcb_writer as pw
+    footprints = pw.read_all_footprints(pcb)
+    if not footprints:
+        return {"status": "error", "message": "No footprints found in PCB."}
+
+    placements = _compute_arrangement(footprints, margin_mm, strategy)
+
+    for p in placements:
+        pw.move_footprint(pcb, p["reference"], p["x"], p["y"], p["rotation"])
+
+    # Compute final bounding box
+    all_x = [p["x"] for p in placements]
+    all_y = [p["y"] for p in placements]
+
+    return {
+        "status": "ok",
+        "source": "file",
+        "strategy": strategy,
+        "components_placed": len(placements),
+        "bounding_box": {
+            "x_min": round(min(all_x) - 5, 1),
+            "y_min": round(min(all_y) - 5, 1),
+            "x_max": round(max(all_x) + 5, 1),
+            "y_max": round(max(all_y) + 5, 1),
+        },
+        "placements": placements,
+        "note": "Wrote placements to .kicad_pcb. Ensure pcbnew is closed.",
+    }
+
+
+# ─── Fit board outline ────────────────────────────────────────────────────
+
+def fit_board_outline(
+    margin_mm: float = 2.0,
+    corner_radius_mm: float = 1.0,
+    snap_to_mm: float = 1.0,
+) -> dict:
+    """Calculate and draw a tight-fitting board outline around all placed components."""
+    pcb = _pcb_file()
+    if not pcb:
+        return {"status": "error", "message": "No pcb_file set. Call set_project first."}
+
+    from . import _pcb_writer as pw
+    footprints = pw.read_all_footprints(pcb)
+    if not footprints:
+        return {"status": "error", "message": "No footprints found in PCB."}
+
+    # Compute global bounding box across all footprints
+    global_min_x = float("inf")
+    global_min_y = float("inf")
+    global_max_x = float("-inf")
+    global_max_y = float("-inf")
+
+    for fp in footprints:
+        x1, y1, x2, y2 = _footprint_bbox(fp)
+        global_min_x = min(global_min_x, x1)
+        global_min_y = min(global_min_y, y1)
+        global_max_x = max(global_max_x, x2)
+        global_max_y = max(global_max_y, y2)
+
+    # Apply margin
+    origin_x = global_min_x - margin_mm
+    origin_y = global_min_y - margin_mm
+    width = global_max_x - global_min_x + 2 * margin_mm
+    height = global_max_y - global_min_y + 2 * margin_mm
+
+    # Snap dimensions up
+    if snap_to_mm > 0:
+        width = math.ceil(width / snap_to_mm) * snap_to_mm
+        height = math.ceil(height / snap_to_mm) * snap_to_mm
+        # Also snap origin to grid
+        origin_x = math.floor(origin_x / snap_to_mm) * snap_to_mm
+        origin_y = math.floor(origin_y / snap_to_mm) * snap_to_mm
+
+    # Strip existing outline and write new one
+    pw.strip_edge_cuts(pcb)
+    segments = pw.append_rounded_rect_outline(
+        pcb, width, height, corner_radius_mm, origin_x, origin_y,
+    )
+
+    _project_state["board_outline"] = {
+        "width": width, "height": height,
+        "corner_radius": corner_radius_mm,
+        "origin_x": origin_x, "origin_y": origin_y,
+    }
+
+    return {
+        "status": "ok",
+        "source": "file",
+        "width_mm": round(width, 2),
+        "height_mm": round(height, 2),
+        "origin_x_mm": round(origin_x, 2),
+        "origin_y_mm": round(origin_y, 2),
+        "corner_radius_mm": corner_radius_mm,
+        "board_area_mm2": round(width * height, 2),
+        "components_enclosed": len(footprints),
+        "margin_applied_mm": margin_mm,
+        "segments_created": segments,
+        "note": "Replaced Edge.Cuts outline in .kicad_pcb. Ensure pcbnew is closed.",
+    }
+
+
 HANDLERS = {
     "set_board_outline":  set_board_outline,
     "add_mounting_holes": add_mounting_holes,
@@ -475,9 +928,12 @@ HANDLERS = {
     "fill_zones":         fill_zones,
     "strip_edge_cuts":    strip_edge_cuts,
     "strip_zones":        strip_zones,
+    "strip_tracks":       strip_tracks,
     "save_board":         save_board,
     "get_pad_positions":  get_pad_positions,
     "sync_pcb_from_schematic": sync_pcb_from_schematic,
+    "auto_arrange":       auto_arrange,
+    "fit_board_outline":  fit_board_outline,
 }
 
 
@@ -610,6 +1066,11 @@ TOOL_SCHEMAS = [
         "input_schema": {"type": "object", "properties": {}}
     },
     {
+        "name": "strip_tracks",
+        "description": "Remove all track segments, arcs, and vias from the PCB file. Call before re-running the autorouter so Freerouting does not treat stale traces as fixed pre-routes.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
         "name": "save_board",
         "description": "Save the currently open PCB to disk via KiCad IPC. Use after placements/routes to persist changes.",
         "input_schema": {"type": "object", "properties": {}}
@@ -628,6 +1089,50 @@ TOOL_SCHEMAS = [
                 "reference": {"type": "string", "description": "e.g. R1, U3, BT1"}
             },
             "required": ["reference"]
+        }
+    },
+    {
+        "name": "auto_arrange",
+        "description": "Automatically arrange all footprints on the PCB based on netlist connectivity. Groups decoupling caps near their ICs, places connectors on periphery, crystals near their IC, and spaces components to avoid overlap.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "margin_mm": {
+                    "type": "number",
+                    "default": 3.0,
+                    "description": "Minimum spacing between components in mm"
+                },
+                "strategy": {
+                    "type": "string",
+                    "enum": ["connectivity", "grid"],
+                    "default": "connectivity",
+                    "description": "'connectivity' groups by netlist connections, 'grid' uses simple row/column layout"
+                }
+            }
+        }
+    },
+    {
+        "name": "fit_board_outline",
+        "description": "Calculate and draw a tight-fitting board outline (Edge.Cuts) around all placed components. Replaces any existing outline. Use after auto_arrange or manual placement.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "margin_mm": {
+                    "type": "number",
+                    "default": 2.0,
+                    "description": "Clearance between outermost components and board edge in mm"
+                },
+                "corner_radius_mm": {
+                    "type": "number",
+                    "default": 1.0,
+                    "description": "Corner rounding radius in mm"
+                },
+                "snap_to_mm": {
+                    "type": "number",
+                    "default": 1.0,
+                    "description": "Round board dimensions up to nearest multiple of this value (0 to disable)"
+                }
+            }
         }
     },
 ]
